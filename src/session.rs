@@ -192,7 +192,7 @@ impl HistoryStore {
         let conn = self.connect()?;
         let id = next_id();
         let now = now_ts();
-        let title = shorten(prompt, 72);
+        let title = prompt.trim().to_string();
         self.ensure_project(&conn, project_key, root_path, now)?;
 
         conn.execute(
@@ -213,7 +213,26 @@ impl HistoryStore {
         let conn = self.connect()?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, title, created_at, updated_at FROM sessions WHERE project_key = ?1 ORDER BY updated_at DESC, created_at DESC",
+                "SELECT
+                    sessions.id,
+                    COALESCE(
+                        NULLIF(sessions.title, ''),
+                        (
+                            SELECT events.content
+                            FROM events
+                            WHERE events.session_id = sessions.id
+                              AND events.project_key = sessions.project_key
+                              AND events.kind = 'message'
+                              AND events.role = 'user'
+                            ORDER BY events.created_at ASC, events.seq ASC
+                            LIMIT 1
+                        )
+                    ) AS title,
+                    sessions.created_at,
+                    sessions.updated_at
+                 FROM sessions
+                 WHERE project_key = ?1
+                 ORDER BY updated_at DESC, created_at DESC",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
@@ -245,7 +264,27 @@ impl HistoryStore {
     ) -> Result<Option<SessionSummary>, String> {
         let conn = self.connect()?;
         let mut stmt = conn
-            .prepare("SELECT id, title, created_at, updated_at FROM sessions WHERE id = ?1 AND project_key = ?2")
+            .prepare(
+                "SELECT
+                    sessions.id,
+                    COALESCE(
+                        NULLIF(sessions.title, ''),
+                        (
+                            SELECT events.content
+                            FROM events
+                            WHERE events.session_id = sessions.id
+                              AND events.project_key = sessions.project_key
+                              AND events.kind = 'message'
+                              AND events.role = 'user'
+                            ORDER BY events.created_at ASC, events.seq ASC
+                            LIMIT 1
+                        )
+                    ) AS title,
+                    sessions.created_at,
+                    sessions.updated_at
+                 FROM sessions
+                 WHERE id = ?1 AND project_key = ?2"
+            )
             .map_err(|e| e.to_string())?;
         let session = stmt
             .query_row(params![session_id, project_key], |row| {
@@ -281,11 +320,19 @@ impl HistoryStore {
             params![next_id(), session_id, project_key, role, content, now, seq],
         )
         .map_err(|e| e.to_string())?;
-        conn.execute(
-            "UPDATE sessions SET updated_at = ?2, title = COALESCE(NULLIF(title, ''), ?3) WHERE id = ?1",
-            params![session_id, now, shorten(content, 72)],
-        )
-        .map_err(|e| e.to_string())?;
+        if role == "user" {
+            conn.execute(
+                "UPDATE sessions SET updated_at = ?2, title = COALESCE(NULLIF(title, ''), ?3) WHERE id = ?1",
+                params![session_id, now, shorten(content, 72)],
+            )
+            .map_err(|e| e.to_string())?;
+        } else {
+            conn.execute(
+                "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
+                params![session_id, now],
+            )
+            .map_err(|e| e.to_string())?;
+        }
         Ok(())
     }
 

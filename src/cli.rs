@@ -1,6 +1,7 @@
 use crate::agent_tools::BoxTools;
 use crate::backend::select_backend;
 use crate::config::{AppConfig, AppPaths};
+use crate::mcp::McpRegistry;
 use crate::memory::AnchorStore;
 use crate::prompt::base_developer_prompt;
 use crate::responses_agent;
@@ -10,8 +11,10 @@ use crate::session::{SessionEvent, SessionStore};
 #[derive(Debug, Clone)]
 pub enum Command {
     Tui,
+    Sessions,
     Providers,
     Models,
+    Mcp,
     Run { prompt: String },
     Lattice { action: LatticeAction },
     Help,
@@ -46,8 +49,10 @@ pub fn parse_args(args: Vec<String>) -> Cli {
         Some("-h") | Some("--help") => Command::Help,
         Some("-V") | Some("--version") => Command::Version,
         Some("tui") => Command::Tui,
+        Some("sessions") => Command::Sessions,
         Some("providers") => Command::Providers,
         Some("models") => Command::Models,
+        Some("mcp") => Command::Mcp,
         Some("box") => parse_lattice_command(&args[1..]),
         Some("run") => {
             let prompt = args.iter().skip(1).cloned().collect::<Vec<_>>().join(" ");
@@ -104,8 +109,10 @@ pub fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Command::Tui => crate::tui::run_tui(paths),
+        Command::Sessions => crate::tui::run_sessions_tui(paths),
         Command::Providers => list_providers(&paths),
         Command::Models => list_models(&paths),
+        Command::Mcp => list_mcp(&paths),
         Command::Run { prompt } => run_prompt(&paths, prompt),
         Command::Lattice { action } => lattice_command(&paths, action),
     }
@@ -150,6 +157,35 @@ fn list_models(paths: &AppPaths) -> Result<(), String> {
     } else {
         println!("{}", models);
     }
+    Ok(())
+}
+
+fn list_mcp(paths: &AppPaths) -> Result<(), String> {
+    let registry = McpRegistry::load(paths)?;
+    if registry.servers().is_empty() {
+        println!("no mcp servers configured");
+        return Ok(());
+    }
+
+    println!("configured servers:");
+    for server in registry.servers() {
+        println!("- {}  {}", server.name, server.command);
+    }
+
+    let tools = registry.discover_tools()?;
+    if tools.is_empty() {
+        println!("no mcp tools discovered");
+    } else {
+        println!();
+        println!("discovered tools:");
+        for tool in tools {
+            println!(
+                "- {}  ({}::{})",
+                tool.function_name, tool.server_name, tool.tool_name
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -269,9 +305,11 @@ fn print_help() {
     println!("usage:");
     println!("  riftcli");
     println!("  riftcli tui");
+    println!("  riftcli sessions");
     println!("  riftcli run <prompt...>");
     println!("  riftcli models");
     println!("  riftcli providers");
+    println!("  riftcli mcp");
     println!("  riftcli box [new|list|run|tools]");
     println!("  riftcli --help");
 }
@@ -323,6 +361,24 @@ mod tests {
         match cli.command {
             Command::Tui => {}
             _ => panic!("expected tui command"),
+        }
+    }
+
+    #[test]
+    fn parse_mcp_command() {
+        let cli = parse_args(vec!["mcp".to_string()]);
+        match cli.command {
+            Command::Mcp => {}
+            _ => panic!("expected mcp command"),
+        }
+    }
+
+    #[test]
+    fn parse_sessions_command() {
+        let cli = parse_args(vec!["sessions".to_string()]);
+        match cli.command {
+            Command::Sessions => {}
+            _ => panic!("expected sessions command"),
         }
     }
 }

@@ -168,7 +168,10 @@ fn format_shell_result(result: CommandResult) -> ToolResponse {
 fn resolve_within_workspace(workspace: &Path, relative_path: &str) -> Result<PathBuf, String> {
     let candidate = Path::new(relative_path);
     if candidate.is_absolute() {
-        return Err("absolute paths are blocked inside the box".to_string());
+        if let Ok(stripped) = candidate.strip_prefix(workspace) {
+            return resolve_within_workspace(workspace, &stripped.display().to_string());
+        }
+        return Err("absolute paths are blocked outside the box workspace".to_string());
     }
 
     let mut resolved = workspace.to_path_buf();

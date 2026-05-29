@@ -6,6 +6,7 @@ mod context;
 mod gateway;
 mod id;
 mod memory;
+mod mcp;
 mod orchestrator;
 mod policy;
 mod prompt;

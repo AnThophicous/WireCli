@@ -1,6 +1,7 @@
 use crate::agent_tools::{BoxTools, BOX_TOOL_NAMES};
 use crate::config::{AppConfig, AppPaths};
 use crate::context::Loom;
+use crate::mcp::{McpRegistry, McpToolSpec};
 use crate::memory::{AnchorInput, AnchorStore};
 use crate::prompt::base_developer_prompt;
 use crate::sandbox::SandboxManager;
@@ -139,16 +140,21 @@ pub async fn run_prompt_with_observer(
 
     let anchors = AnchorStore::new(paths)?;
     let toolbox = BoxTools::new(&sandbox, &anchors);
+    let mcp_registry = McpRegistry::load(paths)?;
+    let mcp_tools = mcp_registry.discover_tools().unwrap_or_default();
     let loom = Loom::new(paths)?;
     let _ = loom
         .maybe_refresh_summary(paths, config, &store, &session.id)
         .await?;
     let bundle = loom.build(paths, config, &store, &session.id, &prompt)?;
     let output = run_agent_loop(
+        paths,
         config,
         &bundle.rendered_prompt,
         &toolbox,
         &box_summary.id,
+        &mcp_registry,
+        &mcp_tools,
         &mut store,
         &paths.project_key,
         &session.id,
@@ -175,10 +181,13 @@ pub async fn run_prompt_with_observer(
 }
 
 async fn run_agent_loop(
+    paths: &AppPaths,
     config: &AppConfig,
     prompt: &str,
     toolbox: &BoxTools<'_>,
     box_id: &str,
+    mcp_registry: &McpRegistry,
+    mcp_tools: &[McpToolSpec],
     store: &mut SessionStore,
     project_key: &str,
     session_id: &str,
@@ -187,7 +196,7 @@ async fn run_agent_loop(
     let upstream_url = config.base_url.clone();
     let client = Client::new();
     let instructions = base_developer_prompt();
-    let tools = tool_definitions();
+    let tools = tool_definitions(paths, mcp_tools);
     let mut previous_response_id: Option<String> = None;
     let mut input = json!(prompt);
     let mut last_text = String::new();
@@ -232,7 +241,15 @@ async fn run_agent_loop(
             let mut outputs = Vec::new();
             for call in turn.tool_calls {
                 observer.on_event(AgentEvent::ToolCallStart { name: &call.name });
-                let output = dispatch_tool(toolbox, project_key, session_id, box_id, call.clone())?;
+                let output = dispatch_tool(
+                    toolbox,
+                    project_key,
+                    session_id,
+                    box_id,
+                    mcp_registry,
+                    mcp_tools,
+                    call.clone(),
+                )?;
                 observer.on_event(AgentEvent::ToolCallResult {
                     name: &call.name,
                     output: &output,
@@ -625,9 +642,26 @@ fn dispatch_tool(
     project_key: &str,
     session_id: &str,
     box_id: &str,
+    mcp_registry: &McpRegistry,
+    mcp_tools: &[McpToolSpec],
     call: ToolCall,
 ) -> Result<String, String> {
     match call.name.as_str() {
+        name if name.starts_with("mcp__") => dispatch_mcp_tool(mcp_registry, mcp_tools, call),
+        "mcp_list" => {
+            let mut text = String::from("Configured MCP servers\n");
+            for server in mcp_registry.servers() {
+                text.push_str("- ");
+                text.push_str(&server.name);
+                text.push_str(" :: ");
+                text.push_str(&server.command);
+                text.push('\n');
+            }
+            if mcp_registry.servers().is_empty() {
+                text.push_str("(none)\n");
+            }
+            Ok(text)
+        }
         "shell" => {
             let command = extract_string_array(&call.arguments, "command")?;
             toolbox.shell(box_id, &command).map(|response| {
@@ -749,6 +783,29 @@ fn dispatch_tool(
     }
 }
 
+fn dispatch_mcp_tool(
+    mcp_registry: &McpRegistry,
+    mcp_tools: &[McpToolSpec],
+    call: ToolCall,
+) -> Result<String, String> {
+    let spec = mcp_tools
+        .iter()
+        .find(|tool| tool.function_name == call.name)
+        .ok_or_else(|| format!("unknown MCP tool: {}", call.name))?;
+    mcp_registry.call_tool(spec, &call.arguments).map(|output| {
+        let mut text = String::from("MCP Tool\n");
+        text.push_str(&spec.server_name);
+        text.push_str("::");
+        text.push_str(&spec.tool_name);
+        if !output.trim().is_empty() {
+            text.push_str("\n\n```text\n");
+            text.push_str(&output);
+            text.push_str("\n```");
+        }
+        text
+    })
+}
+
 fn summarize_patch_text(patch_text: &str) -> String {
     let mut out = String::from("Patched\n");
     let mut current_file = String::new();
@@ -838,9 +895,9 @@ fn extract_string_array(value: &Value, key: &str) -> Result<Vec<String>, String>
     Err(format!("missing array field: {key}"))
 }
 
-fn tool_definitions() -> Value {
-    json!([
-        {
+fn tool_definitions(paths: &AppPaths, mcp_tools: &[McpToolSpec]) -> Value {
+    let mut tools = vec![
+        json!({
             "type": "function",
             "name": "shell",
             "description": "Run a command inside the Box workspace.",
@@ -856,8 +913,8 @@ fn tool_definitions() -> Value {
                 "required": ["command"],
                 "additionalProperties": false
             }
-        },
-        {
+        }),
+        json!({
             "type": "function",
             "name": "apply_patch",
             "description": "Apply a structured patch to files inside the Box.",
@@ -872,8 +929,8 @@ fn tool_definitions() -> Value {
                 "required": ["patch_text"],
                 "additionalProperties": false
             }
-        },
-        {
+        }),
+        json!({
             "type": "function",
             "name": "list_dir",
             "description": "List files and folders inside the Box workspace.",
@@ -888,8 +945,8 @@ fn tool_definitions() -> Value {
                 "required": ["path"],
                 "additionalProperties": false
             }
-        },
-        {
+        }),
+        json!({
             "type": "function",
             "name": "read_file",
             "description": "Read a file inside the Box workspace.",
@@ -904,8 +961,8 @@ fn tool_definitions() -> Value {
                 "required": ["path"],
                 "additionalProperties": false
             }
-        },
-        {
+        }),
+        json!({
             "type": "function",
             "name": "write_file",
             "description": "Write a file inside the Box workspace.",
@@ -924,8 +981,8 @@ fn tool_definitions() -> Value {
                 "required": ["path", "content"],
                 "additionalProperties": false
             }
-        },
-        {
+        }),
+        json!({
             "type": "function",
             "name": "search",
             "description": "Search the Box workspace for code and text matches.",
@@ -940,8 +997,8 @@ fn tool_definitions() -> Value {
                 "required": ["pattern"],
                 "additionalProperties": false
             }
-        },
-        {
+        }),
+        json!({
             "type": "function",
             "name": "remember",
             "description": "Store durable Anchor memory for later sessions.",
@@ -973,8 +1030,8 @@ fn tool_definitions() -> Value {
                 "required": ["content"],
                 "additionalProperties": false
             }
-        },
-        {
+        }),
+        json!({
             "type": "function",
             "name": "recall",
             "description": "Search Anchor memory for relevant prior facts.",
@@ -989,8 +1046,28 @@ fn tool_definitions() -> Value {
                 "required": ["query"],
                 "additionalProperties": false
             }
+        })
+    ];
+
+    for tool in mcp_tools {
+        tools.push(tool.function_definition());
+    }
+
+    tools.push(json!({
+        "type": "function",
+        "name": "mcp_list",
+        "description": format!(
+            "List configured MCP servers for the current project at {}.",
+            paths.mcp_file.display()
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
         }
-    ])
+    }));
+
+    Value::Array(tools)
 }
 
 #[cfg(test)]

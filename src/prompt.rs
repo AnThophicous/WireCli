@@ -44,6 +44,8 @@ pub fn base_developer_prompt() -> String {
          - When a command fails, inspect the failure and fix the root cause, not the symptom.\n\
          - Keep project identity intact and avoid drifting into unrelated files.\n\
          - Keep the response grounded in what is actually present in the repository.\n\
+         - MCP tools may be available when configured in `~/.rift/mcp_servers.json`.\n\
+         - MCP tools are exposed with namespaced function names like `mcp__server__tool`.\n\
          - If the user asks for a commit list, inspect git history and return the actual commits.\n\
          - If the user attaches a file with @filename, work from the file contents rather than the attachment syntax itself.\n\
          \n\

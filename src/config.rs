@@ -12,6 +12,7 @@ pub struct AppPaths {
     pub config_dir: PathBuf,
     pub config_file: PathBuf,
     pub theme_file: PathBuf,
+    pub mcp_file: PathBuf,
     pub data_dir: PathBuf,
     pub history_db: PathBuf,
     pub anchor_db: PathBuf,
@@ -47,6 +48,10 @@ impl AppPaths {
         fs::create_dir_all(&config_dir).map_err(|e| e.to_string())?;
         let config_file = config_dir.join("config.yaml");
         let theme_file = rift_dir.join("theme.yaml");
+        let mcp_file = rift_dir.join("mcp_servers.json");
+        if !mcp_file.exists() {
+            fs::write(&mcp_file, "{\n  \"servers\": []\n}\n").map_err(|e| e.to_string())?;
+        }
         let data_dir = rift_dir.join("data");
         fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
         let history_db = data_dir.join("history.sqlite3");
@@ -61,6 +66,7 @@ impl AppPaths {
             config_dir,
             config_file,
             theme_file,
+            mcp_file,
             data_dir,
             history_db,
             anchor_db,

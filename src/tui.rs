@@ -1,6 +1,10 @@
 use crate::config::{AppConfig, AppPaths, ThemeConfig};
 use crate::responses_agent;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
+use crate::session::{SessionStore, SessionSummary};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseEventKind,
+};
 use crossterm::event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -80,11 +84,33 @@ struct FilePickerState {
 pub fn run_tui(paths: AppPaths) -> Result<(), String> {
     let config = AppConfig::load(&paths)?;
     let theme = ThemeConfig::load_or_create(&paths.theme_file)?;
-    let models = load_models(&config).unwrap_or_else(|_| vec![config.model.clone()]);
+    let (models, startup_notice) = match load_models(&config) {
+        Ok(models) if !models.is_empty() => (models, None),
+        Ok(_) => (
+            vec![config.model.clone()],
+            Some("- No Model's found. Are you running AI Proxy's?".to_string()),
+        ),
+        Err(err) => (
+            vec![config.model.clone()],
+            Some(format!("- No Model's found. Are you running AI Proxy's? ({err})")),
+        ),
+    };
     let logo = load_logo(&paths);
 
-    let mut app = App::new(paths, config, models, logo, theme);
+    let mut app = App::new(paths, config, models, logo, theme, startup_notice);
     app.run()
+}
+
+pub fn run_sessions_tui(paths: AppPaths) -> Result<(), String> {
+    let config = AppConfig::load(&paths)?;
+    let theme = ThemeConfig::load_or_create(&paths.theme_file)?;
+    let sessions = SessionStore::new(&paths)?.list(&paths.project_key)?;
+    let mut picker = SessionPickerApp::new(paths.clone(), config.clone(), sessions, theme);
+    if let Some(session) = picker.run()? {
+        run_session_view_tui(paths, config, session.id)
+    } else {
+        Ok(())
+    }
 }
 
 struct App {
@@ -103,9 +129,11 @@ struct App {
     overlay: Overlay,
     logo: Vec<String>,
     theme: ThemeConfig,
+    startup_notice: Option<String>,
     started_at: Instant,
     pending_prompt: Option<FilePickerState>,
-    feed_scroll: u16,
+    feed_scroll: usize,
+    feed_max_scroll: usize,
     follow_latest: bool,
 }
 
@@ -116,6 +144,7 @@ impl App {
         models: Vec<String>,
         logo: Vec<String>,
         theme: ThemeConfig,
+        startup_notice: Option<String>,
     ) -> Self {
         let selected_model = models
             .iter()
@@ -137,9 +166,11 @@ impl App {
             overlay: Overlay::None,
             logo,
             theme,
+            startup_notice,
             started_at: Instant::now(),
             pending_prompt: None,
             feed_scroll: 0,
+            feed_max_scroll: 0,
             follow_latest: true,
         }
     }
@@ -191,14 +222,14 @@ impl App {
             return;
         }
 
-        if self.running {
-            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
             }
-            return;
-        }
-
-        match key.code {
+            KeyCode::PageUp => self.scroll_feed(-6),
+            KeyCode::PageDown => self.scroll_feed(6),
+            KeyCode::End if self.running => self.scroll_feed_to_bottom(),
+            _ if self.running => return,
             KeyCode::Esc => {
                 if self.input.is_empty() {
                     self.should_quit = true;
@@ -207,15 +238,10 @@ impl App {
                     self.cursor = 0;
                 }
             }
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true;
-            }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.insert_newline();
             }
             KeyCode::Enter => self.submit_prompt(),
-            KeyCode::PageUp => self.scroll_feed(-6),
-            KeyCode::PageDown => self.scroll_feed(6),
             KeyCode::Tab => self.cycle_model(1),
             KeyCode::BackTab => self.cycle_model(-1),
             KeyCode::Left => {
@@ -591,7 +617,7 @@ impl App {
         }
     }
 
-    fn draw(&self, frame: &mut ratatui::Frame<'_>) {
+    fn draw(&mut self, frame: &mut ratatui::Frame<'_>) {
         let area = frame.area();
         if self.messages.is_empty() {
             self.draw_welcome(frame, area);
@@ -670,12 +696,26 @@ impl App {
             x: area.x + 2,
             y: logo_area.y + logo_area.height + 1,
             width: area.width.saturating_sub(4),
-            height: 1,
+            height: if self.startup_notice.is_some() { 2 } else { 1 },
         };
-        frame.render_widget(hint, hint_area);
+        frame.render_widget(hint, Rect { height: 1, ..hint_area });
+        if let Some(notice) = &self.startup_notice {
+            let notice_area = Rect {
+                x: hint_area.x,
+                y: hint_area.y + 1,
+                width: hint_area.width,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(notice.clone())
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(self.theme.muted)),
+                notice_area,
+            );
+        }
     }
 
-    fn draw_feed(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+    fn draw_feed(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {
         let mut lines = Vec::new();
         for (idx, message) in self.messages.iter().enumerate() {
             let is_last_assistant = self.running
@@ -689,6 +729,8 @@ impl App {
                 body_color(&message.role, &self.theme),
                 &message.content,
                 matches!(message.role, MessageRole::Assistant | MessageRole::Tool),
+                matches!(message.role, MessageRole::Assistant)
+                    && is_last_assistant,
                 matches!(message.role, MessageRole::Tool)
                     && message.title.as_deref() == Some("Patched"),
                 area.width as usize,
@@ -697,20 +739,21 @@ impl App {
             lines.push(Line::from(""));
         }
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(self.theme.border))
-            .border_type(BorderType::Rounded);
-        let viewport_rows = area.height.saturating_sub(2);
-        let max_scroll = lines.len().saturating_sub(viewport_rows as usize) as u16;
-        let scroll_rows = self.feed_scroll.min(max_scroll);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(block)
-                .wrap(Wrap { trim: false })
-                .scroll((scroll_rows, 0)),
-            area,
-        );
+        let viewport_rows = area.height as usize;
+        let max_scroll = lines.len().saturating_sub(viewport_rows);
+        self.feed_max_scroll = max_scroll;
+        if self.follow_latest {
+            self.feed_scroll = max_scroll;
+        } else {
+            self.feed_scroll = self.feed_scroll.min(max_scroll);
+        }
+        let scroll_rows = self.feed_scroll;
+        let visible = lines
+            .into_iter()
+            .skip(scroll_rows)
+            .take(viewport_rows)
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(visible).wrap(Wrap { trim: false }), area);
     }
 
     fn draw_prompt(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
@@ -730,13 +773,7 @@ impl App {
             self.current_model()
         );
         let text = if self.input.is_empty() {
-            vec![Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
-                    "type a prompt",
-                    Style::default().fg(self.theme.muted),
-                ),
-            ])]
+            vec![Line::from("")]
         } else {
             self.input
                 .split('\n')
@@ -764,6 +801,20 @@ impl App {
             .alignment(Alignment::Left);
 
         frame.render_widget(input, prompt_area);
+
+        if self.input.is_empty() {
+            frame.render_widget(
+                Paragraph::new("type a prompt")
+                    .alignment(Alignment::Left)
+                    .style(Style::default().fg(self.theme.muted)),
+                Rect {
+                    x: input_area.x,
+                    y: input_area.y,
+                    width: input_area.width,
+                    height: 1,
+                },
+            );
+        }
 
         if !self.running {
             let (cursor_row, cursor_col) = cursor_position(&self.input, self.cursor);
@@ -936,23 +987,31 @@ impl App {
         self.cursor += '\n'.len_utf8();
     }
 
-    fn scroll_feed(&mut self, delta: i16) {
+    fn scroll_feed(&mut self, delta: i32) {
         if self.messages.is_empty() {
             return;
         }
         if delta.is_negative() {
             self.follow_latest = false;
         }
-        let next = if delta.is_negative() {
-            self.feed_scroll.saturating_sub(delta.wrapping_abs() as u16)
+        let base = if self.follow_latest {
+            self.feed_max_scroll
         } else {
-            self.feed_scroll.saturating_add(delta as u16)
+            self.feed_scroll
+        };
+        let next = if delta < 0 {
+            base.saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            base.saturating_add(delta as usize).min(self.feed_max_scroll)
         };
         self.feed_scroll = next;
+        if self.feed_scroll >= self.feed_max_scroll {
+            self.follow_latest = true;
+        }
     }
 
     fn scroll_feed_to_bottom(&mut self) {
-        self.feed_scroll = u16::MAX;
+        self.feed_scroll = self.feed_max_scroll;
         self.follow_latest = true;
     }
 
@@ -1080,6 +1139,20 @@ fn load_models(config: &AppConfig) -> Result<Vec<String>, String> {
         .build()
         .map_err(|e| e.to_string())?;
     runtime.block_on(async {
+        let health_url = format!("{}/health", health_base_url(&config.base_url));
+        let health_response = reqwest::Client::new()
+            .get(health_url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if health_response.status() != reqwest::StatusCode::OK {
+            return Err(format!("health endpoint returned {}", health_response.status()));
+        }
+        let health_value: serde_json::Value =
+            health_response.json().await.map_err(|e| e.to_string())?;
+        if health_value.get("status").and_then(|v| v.as_str()) != Some("ok") {
+            return Err(format!("health endpoint returned unexpected payload: {}", health_value));
+        }
         let url = format!("{}/models", config.base_url.trim_end_matches('/'));
         let response = reqwest::Client::new()
             .get(url)
@@ -1104,6 +1177,94 @@ fn load_models(config: &AppConfig) -> Result<Vec<String>, String> {
         }
         Ok(models)
     })
+}
+
+fn health_base_url(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    if let Some(stripped) = trimmed.strip_suffix("/v1") {
+        stripped.trim_end_matches('/').to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn run_session_view_tui(paths: AppPaths, config: AppConfig, session_id: String) -> Result<(), String> {
+    let store = SessionStore::new(&paths)?;
+    let timeline = store.timeline(&paths.project_key, &session_id)?;
+    let selected = store
+        .resolve(&paths.project_key, Some(session_id.clone()))?;
+    let theme = ThemeConfig::load_or_create(&paths.theme_file)?;
+    let logo = load_logo(&paths);
+    let model = config.model.clone();
+
+    let mut app = App::new(
+        paths,
+        config,
+        vec![model],
+        logo,
+        theme,
+        None,
+    );
+    app.session_id = Some(session_id);
+    app.status = selected
+        .summary
+        .clone()
+        .unwrap_or_else(|| "untitled session".to_string());
+    app.messages = timeline_to_chat_messages(&timeline);
+    app.running = false;
+    app.follow_latest = true;
+    app.scroll_feed_to_bottom();
+    app.run()
+}
+
+fn timeline_to_chat_messages(events: &[crate::session::TimelineEvent]) -> Vec<ChatMessage> {
+    let mut messages = Vec::new();
+    for event in events {
+        match event.kind.as_str() {
+            "message" => {
+                let role = match event.role.as_deref() {
+                    Some("assistant") => MessageRole::Assistant,
+                    Some("tool") => MessageRole::Tool,
+                    Some("system") | Some("developer") => MessageRole::System,
+                    _ => MessageRole::User,
+                };
+                messages.push(ChatMessage {
+                    role,
+                    title: None,
+                    content: event.content.clone().unwrap_or_default(),
+                });
+            }
+            "command" => {
+                let mut text = String::new();
+                if let Some(command) = &event.command {
+                    text.push_str(command);
+                }
+                if let Some(stdout) = &event.stdout {
+                    if !stdout.trim().is_empty() {
+                        if !text.is_empty() {
+                            text.push_str("\n\n");
+                        }
+                        text.push_str(stdout);
+                    }
+                }
+                if let Some(stderr) = &event.stderr {
+                    if !stderr.trim().is_empty() {
+                        if !text.is_empty() {
+                            text.push_str("\n\n");
+                        }
+                        text.push_str(stderr);
+                    }
+                }
+                messages.push(ChatMessage {
+                    role: MessageRole::Tool,
+                    title: Some(event.content.clone().unwrap_or_else(|| "Executed".to_string())),
+                    content: text,
+                });
+            }
+            _ => {}
+        }
+    }
+    messages
 }
 
 fn load_logo(paths: &AppPaths) -> Vec<String> {
@@ -1240,6 +1401,7 @@ fn render_card(
     body_color: Color,
     content: &str,
     markdown: bool,
+    thinking: bool,
     diff_mode: bool,
     width: usize,
     theme: &ThemeConfig,
@@ -1265,9 +1427,21 @@ fn render_card(
     };
 
     if body.is_empty() {
+        let placeholder = if content.trim().is_empty() {
+            if thinking {
+                "thinking…"
+            } else {
+                "awaiting output"
+            }
+        } else {
+            " "
+        };
         lines.push(Line::from(vec![
             Span::styled("│ ", Style::default().fg(color)),
-            Span::raw(" "),
+            Span::styled(
+                placeholder.to_string(),
+                Style::default().fg(theme.muted),
+            ),
         ]));
     } else {
         for line in wrap_rendered_lines(body, width.saturating_sub(4)) {
@@ -1333,32 +1507,64 @@ fn render_markdown_lines(content: &str, color: Color, theme: &ThemeConfig) -> Ve
     let parser = Parser::new_ext(content, Options::all());
     let mut current = Vec::<Span<'static>>::new();
     let mut in_code = false;
+    let mut code_lines = Vec::<String>::new();
     let mut list_level = 0usize;
+
+    let mut flush_current = |lines: &mut Vec<Line<'static>>, current: &mut Vec<Span<'static>>| {
+        if !current.is_empty() {
+            lines.push(Line::from(current.clone()));
+            current.clear();
+        }
+    };
+
+    let mut flush_code = |lines: &mut Vec<Line<'static>>, code_lines: &mut Vec<String>| {
+        if code_lines.is_empty() {
+            return;
+        }
+        let preview_len = code_lines.len().min(3);
+        let hidden_len = code_lines.len().saturating_sub(preview_len);
+        lines.push(Line::from(vec![
+            Span::styled("┌", Style::default().fg(theme.border)),
+            Span::styled(" code", Style::default().fg(theme.muted)),
+        ]));
+        for code_line in code_lines.iter().take(preview_len) {
+            lines.push(Line::from(vec![
+                Span::styled("│ ", Style::default().fg(theme.border)),
+                Span::styled(code_line.clone(), Style::default().fg(theme.muted)),
+            ]));
+        }
+        if hidden_len > 0 {
+            lines.push(Line::from(vec![
+                Span::styled("│ ", Style::default().fg(theme.border)),
+                Span::styled(
+                    format!("… +{hidden_len} lines"),
+                    Style::default().fg(theme.muted),
+                ),
+            ]));
+        }
+        code_lines.clear();
+        lines.push(Line::from(vec![
+            Span::styled("└", Style::default().fg(theme.border)),
+            Span::styled(" code", Style::default().fg(theme.muted)),
+        ]));
+    };
 
     for event in parser {
         match event {
             MdEvent::Start(tag) => match tag {
                 Tag::Paragraph => {
-                    if !current.is_empty() {
-                        lines.push(Line::from(current.clone()));
-                        current.clear();
-                    }
+                    flush_current(&mut lines, &mut current);
                 }
                 Tag::Heading { level, .. } => {
-                    if !current.is_empty() {
-                        lines.push(Line::from(current.clone()));
-                        current.clear();
-                    }
+                    flush_current(&mut lines, &mut current);
                     current.push(Span::styled(
                         heading_prefix(level),
                         Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
                     ));
                 }
                 Tag::CodeBlock(_) => {
-                    if !current.is_empty() {
-                        lines.push(Line::from(current.clone()));
-                        current.clear();
-                    }
+                    flush_current(&mut lines, &mut current);
+                    flush_code(&mut lines, &mut code_lines);
                     in_code = true;
                 }
                 Tag::List(_) => {
@@ -1374,52 +1580,40 @@ fn render_markdown_lines(content: &str, color: Color, theme: &ThemeConfig) -> Ve
             },
             MdEvent::End(tag) => match tag {
                 TagEnd::Paragraph | TagEnd::Heading(_) => {
-                    if !current.is_empty() {
-                        lines.push(Line::from(current.clone()));
-                        current.clear();
-                    }
+                    flush_current(&mut lines, &mut current);
                 }
                 TagEnd::CodeBlock => {
                     in_code = false;
-                    if !current.is_empty() {
-                        lines.push(Line::from(current.clone()));
-                        current.clear();
-                    }
+                    flush_code(&mut lines, &mut code_lines);
                 }
                 TagEnd::List(_) => {
                     list_level = list_level.saturating_sub(1);
-                    if !current.is_empty() {
-                        lines.push(Line::from(current.clone()));
-                        current.clear();
-                    }
+                    flush_current(&mut lines, &mut current);
                 }
                 TagEnd::Item => {
-                    if !current.is_empty() {
-                        lines.push(Line::from(current.clone()));
-                        current.clear();
-                    }
+                    flush_current(&mut lines, &mut current);
                 }
                 _ => {}
             },
             MdEvent::Text(text) => {
-                let style = if in_code {
-                    Style::default().fg(theme.text)
+                if in_code {
+                    for part in text.lines() {
+                        code_lines.push(part.to_string());
+                    }
+                    if text.ends_with('\n') {
+                        code_lines.push(String::new());
+                    }
                 } else {
-                    Style::default().fg(color)
-                };
-                for part in text.lines() {
-                    if !current.is_empty() && part.is_empty() {
-                        lines.push(Line::from(current.clone()));
-                        current.clear();
-                        continue;
-                    }
-                    if !current.is_empty() {
-                        current.push(Span::raw(" "));
-                    }
-                    current.extend(parse_inline_spans(part, style, theme));
-                    if in_code {
-                        lines.push(Line::from(current.clone()));
-                        current.clear();
+                    let style = Style::default().fg(color);
+                    for part in text.lines() {
+                        if !current.is_empty() && part.is_empty() {
+                            flush_current(&mut lines, &mut current);
+                            continue;
+                        }
+                        if !current.is_empty() {
+                            current.push(Span::raw(" "));
+                        }
+                        current.extend(parse_inline_spans(part, style, theme));
                     }
                 }
             }
@@ -1447,9 +1641,8 @@ fn render_markdown_lines(content: &str, color: Color, theme: &ThemeConfig) -> Ve
         }
     }
 
-    if !current.is_empty() {
-        lines.push(Line::from(current));
-    }
+    flush_current(&mut lines, &mut current);
+    flush_code(&mut lines, &mut code_lines);
 
     lines
 }
@@ -1644,6 +1837,7 @@ fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>, String> {
     enable_raw_mode().map_err(|e| e.to_string())?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).map_err(|e| e.to_string())?;
+    execute!(stdout, EnableMouseCapture).map_err(|e| e.to_string())?;
     execute!(
         stdout,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
@@ -1656,6 +1850,7 @@ fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>, String> {
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<(), String> {
     disable_raw_mode().map_err(|e| e.to_string())?;
     execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags).map_err(|e| e.to_string())?;
+    execute!(terminal.backend_mut(), DisableMouseCapture).map_err(|e| e.to_string())?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen).map_err(|e| e.to_string())?;
     terminal.show_cursor().map_err(|e| e.to_string())
 }
@@ -1666,4 +1861,215 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     Rect::new(x, y, width, height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::health_base_url;
+
+    #[test]
+    fn health_base_url_strips_v1_suffix() {
+        assert_eq!(health_base_url("http://127.0.0.1:3000/v1"), "http://127.0.0.1:3000");
+    }
+
+    #[test]
+    fn health_base_url_keeps_root_url() {
+        assert_eq!(health_base_url("http://127.0.0.1:3000"), "http://127.0.0.1:3000");
+    }
+}
+
+struct SessionPickerApp {
+    paths: AppPaths,
+    config: AppConfig,
+    sessions: Vec<SessionSummary>,
+    theme: ThemeConfig,
+    selected: usize,
+    scroll: usize,
+    should_quit: bool,
+    chosen: Option<SessionSummary>,
+}
+
+impl SessionPickerApp {
+    fn new(
+        paths: AppPaths,
+        config: AppConfig,
+        sessions: Vec<SessionSummary>,
+        theme: ThemeConfig,
+    ) -> Self {
+        Self {
+            paths,
+            config,
+            sessions,
+            theme,
+            selected: 0,
+            scroll: 0,
+            should_quit: false,
+            chosen: None,
+        }
+    }
+
+    fn run(&mut self) -> Result<Option<SessionSummary>, String> {
+        let mut terminal = init_terminal()?;
+        let result = self.event_loop(&mut terminal);
+        let restore_result = restore_terminal(&mut terminal);
+        match (result, restore_result) {
+            (Ok(()), Ok(())) => Ok(self.chosen.clone()),
+            (Err(err), Ok(())) => Err(err),
+            (Ok(()), Err(err)) => Err(err),
+            (Err(err), Err(_restore_err)) => Err(err),
+        }
+    }
+
+    fn event_loop(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> Result<(), String> {
+        loop {
+            terminal
+                .draw(|frame| self.draw(frame))
+                .map_err(|e| e.to_string())?;
+
+            if self.should_quit {
+                break;
+            }
+
+            if event::poll(Duration::from_millis(50)).map_err(|e| e.to_string())? {
+                match event::read().map_err(|e| e.to_string())? {
+                    Event::Key(key) => self.handle_key(key),
+                    Event::Mouse(mouse) => match mouse.kind {
+                        MouseEventKind::ScrollDown => self.scroll(6),
+                        MouseEventKind::ScrollUp => self.scroll(-6),
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.should_quit = true,
+            KeyCode::Enter => {
+                self.chosen = self.sessions.get(self.selected).cloned();
+                self.should_quit = true;
+            }
+            KeyCode::Up => self.move_selection(-1),
+            KeyCode::Down => self.move_selection(1),
+            KeyCode::PageUp => self.move_selection(-8),
+            KeyCode::PageDown => self.move_selection(8),
+            KeyCode::Home => self.set_selection(0),
+            KeyCode::End => {
+                let last = self.sessions.len().saturating_sub(1);
+                self.set_selection(last);
+            }
+            _ => {}
+        }
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        let len = self.sessions.len() as isize;
+        let next = (self.selected as isize + delta).clamp(0, len.saturating_sub(1));
+        self.set_selection(next as usize);
+    }
+
+    fn set_selection(&mut self, selected: usize) {
+        self.selected = selected.min(self.sessions.len().saturating_sub(1));
+        let visible = 8usize;
+        if self.selected < self.scroll {
+            self.scroll = self.selected;
+        } else if self.selected >= self.scroll.saturating_add(visible) {
+            self.scroll = self.selected.saturating_add(1).saturating_sub(visible);
+        }
+    }
+
+    fn scroll(&mut self, delta: i16) {
+        if delta.is_negative() {
+            self.move_selection(-(delta as isize));
+        } else {
+            self.move_selection(delta as isize);
+        }
+    }
+
+    fn draw(&self, frame: &mut ratatui::Frame<'_>) {
+        let area = frame.area();
+        let width = area.width.saturating_sub(14).min(104);
+        let height = area.height.saturating_sub(10).min(18).max(12);
+        let modal = centered_rect(width, height, area);
+        frame.render_widget(Clear, modal);
+
+        let title = format!("sessions  ·  {}", self.config.provider);
+        let visible = modal.height.saturating_sub(4).max(1) as usize;
+        let start = self.scroll.min(self.sessions.len().saturating_sub(1));
+        let end = (start + visible).min(self.sessions.len());
+        let slice = &self.sessions[start..end];
+        let items = slice
+            .iter()
+            .map(|session| {
+                let label = session
+                    .summary
+                    .clone()
+                    .unwrap_or_else(|| "untitled session".to_string());
+                let line = format!("{label}  ·  {}", session.updated_at);
+                ListItem::new(Line::from(Span::styled(
+                    line,
+                    Style::default().fg(Color::White),
+                )))
+            })
+            .collect::<Vec<_>>();
+
+        let mut state = ListState::default();
+        state.select(Some(
+            self.selected
+                .saturating_sub(start)
+                .min(slice.len().saturating_sub(1)),
+        ));
+
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .title(Line::from(vec![
+                        Span::styled(
+                            "riftcli",
+                            Style::default()
+                                .fg(self.theme.accent)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw("  "),
+                        Span::styled(title, Style::default().fg(self.theme.muted)),
+                    ]))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(self.theme.border))
+                    .border_type(BorderType::Rounded),
+            )
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(self.theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("▸ ");
+        frame.render_stateful_widget(list, modal, &mut state);
+
+        let hint = if self.sessions.is_empty() {
+            "No sessions found"
+        } else {
+            "Enter choose  ·  Esc close  ·  arrows navigate"
+        };
+        frame.render_widget(
+            Paragraph::new(hint)
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::DarkGray)),
+            Rect {
+                x: modal.x + 1,
+                y: modal.y + modal.height.saturating_sub(2),
+                width: modal.width.saturating_sub(2),
+                height: 1,
+            },
+        );
+    }
 }

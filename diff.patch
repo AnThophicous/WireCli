@@ -1,0 +1,553 @@
+diff --git a/src/cli.rs b/src/cli.rs
+index d92f58d..96b7c28 100644
+--- a/src/cli.rs
++++ b/src/cli.rs
+@@ -10,6 +10,7 @@ use crate::session::{SessionEvent, SessionStore};
+ #[derive(Debug, Clone)]
+ pub enum Command {
+     Tui,
++    Sessions,
+     Providers,
+     Models,
+     Run { prompt: String },
+@@ -46,6 +47,7 @@ pub fn parse_args(args: Vec<String>) -> Cli {
+         Some("-h") | Some("--help") => Command::Help,
+         Some("-V") | Some("--version") => Command::Version,
+         Some("tui") => Command::Tui,
++        Some("sessions") => Command::Sessions,
+         Some("providers") => Command::Providers,
+         Some("models") => Command::Models,
+         Some("box") => parse_lattice_command(&args[1..]),
+@@ -104,6 +106,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
+             Ok(())
+         }
+         Command::Tui => crate::tui::run_tui(paths),
++        Command::Sessions => crate::tui::run_sessions_tui(paths),
+         Command::Providers => list_providers(&paths),
+         Command::Models => list_models(&paths),
+         Command::Run { prompt } => run_prompt(&paths, prompt),
+@@ -269,6 +272,7 @@ fn print_help() {
+     println!("usage:");
+     println!("  riftcli");
+     println!("  riftcli tui");
++    println!("  riftcli sessions");
+     println!("  riftcli run <prompt...>");
+     println!("  riftcli models");
+     println!("  riftcli providers");
+@@ -325,4 +329,13 @@ mod tests {
+             _ => panic!("expected tui command"),
+         }
+     }
++
++    #[test]
++    fn parse_sessions_command() {
++        let cli = parse_args(vec!["sessions".to_string()]);
++        match cli.command {
++            Command::Sessions => {}
++            _ => panic!("expected sessions command"),
++        }
++    }
+ }
+diff --git a/src/config.rs b/src/config.rs
+index 2df4130..4f213cf 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -12,6 +12,7 @@ pub struct AppPaths {
+     pub config_dir: PathBuf,
+     pub config_file: PathBuf,
+     pub theme_file: PathBuf,
++    pub mcp_file: PathBuf,
+     pub data_dir: PathBuf,
+     pub history_db: PathBuf,
+     pub anchor_db: PathBuf,
+@@ -47,6 +48,10 @@ impl AppPaths {
+         fs::create_dir_all(&config_dir).map_err(|e| e.to_string())?;
+         let config_file = config_dir.join("config.yaml");
+         let theme_file = rift_dir.join("theme.yaml");
++        let mcp_file = rift_dir.join("mcp_servers.json");
++        if !mcp_file.exists() {
++            fs::write(&mcp_file, "{\n  \"servers\": []\n}\n").map_err(|e| e.to_string())?;
++        }
+         let data_dir = rift_dir.join("data");
+         fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
+         let history_db = data_dir.join("history.sqlite3");
+@@ -61,6 +66,7 @@ impl AppPaths {
+             config_dir,
+             config_file,
+             theme_file,
++            mcp_file,
+             data_dir,
+             history_db,
+             anchor_db,
+diff --git a/src/main.rs b/src/main.rs
+index c78af91..1926d62 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -6,6 +6,7 @@ mod context;
+ mod gateway;
+ mod id;
+ mod memory;
++mod mcp;
+ mod orchestrator;
+ mod policy;
+ mod prompt;
+diff --git a/src/session.rs b/src/session.rs
+index 811901d..91a436e 100644
+--- a/src/session.rs
++++ b/src/session.rs
+@@ -192,7 +192,7 @@ impl HistoryStore {
+         let conn = self.connect()?;
+         let id = next_id();
+         let now = now_ts();
+-        let title = shorten(prompt, 72);
++        let title = prompt.trim().to_string();
+         self.ensure_project(&conn, project_key, root_path, now)?;
+ 
+         conn.execute(
+@@ -213,7 +213,26 @@ impl HistoryStore {
+         let conn = self.connect()?;
+         let mut stmt = conn
+             .prepare(
+-                "SELECT id, title, created_at, updated_at FROM sessions WHERE project_key = ?1 ORDER BY updated_at DESC, created_at DESC",
++                "SELECT
++                    sessions.id,
++                    COALESCE(
++                        NULLIF(sessions.title, ''),
++                        (
++                            SELECT events.content
++                            FROM events
++                            WHERE events.session_id = sessions.id
++                              AND events.project_key = sessions.project_key
++                              AND events.kind = 'message'
++                              AND events.role = 'user'
++                            ORDER BY events.created_at ASC, events.seq ASC
++                            LIMIT 1
++                        )
++                    ) AS title,
++                    sessions.created_at,
++                    sessions.updated_at
++                 FROM sessions
++                 WHERE project_key = ?1
++                 ORDER BY updated_at DESC, created_at DESC",
+             )
+             .map_err(|e| e.to_string())?;
+         let rows = stmt
+@@ -245,7 +264,27 @@ impl HistoryStore {
+     ) -> Result<Option<SessionSummary>, String> {
+         let conn = self.connect()?;
+         let mut stmt = conn
+-            .prepare("SELECT id, title, created_at, updated_at FROM sessions WHERE id = ?1 AND project_key = ?2")
++            .prepare(
++                "SELECT
++                    sessions.id,
++                    COALESCE(
++                        NULLIF(sessions.title, ''),
++                        (
++                            SELECT events.content
++                            FROM events
++                            WHERE events.session_id = sessions.id
++                              AND events.project_key = sessions.project_key
++                              AND events.kind = 'message'
++                              AND events.role = 'user'
++                            ORDER BY events.created_at ASC, events.seq ASC
++                            LIMIT 1
++                        )
++                    ) AS title,
++                    sessions.created_at,
++                    sessions.updated_at
++                 FROM sessions
++                 WHERE id = ?1 AND project_key = ?2"
++            )
+             .map_err(|e| e.to_string())?;
+         let session = stmt
+             .query_row(params![session_id, project_key], |row| {
+@@ -281,11 +320,19 @@ impl HistoryStore {
+             params![next_id(), session_id, project_key, role, content, now, seq],
+         )
+         .map_err(|e| e.to_string())?;
+-        conn.execute(
+-            "UPDATE sessions SET updated_at = ?2, title = COALESCE(NULLIF(title, ''), ?3) WHERE id = ?1",
+-            params![session_id, now, shorten(content, 72)],
+-        )
+-        .map_err(|e| e.to_string())?;
++        if role == "user" {
++            conn.execute(
++                "UPDATE sessions SET updated_at = ?2, title = COALESCE(NULLIF(title, ''), ?3) WHERE id = ?1",
++                params![session_id, now, shorten(content, 72)],
++            )
++            .map_err(|e| e.to_string())?;
++        } else {
++            conn.execute(
++                "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
++                params![session_id, now],
++            )
++            .map_err(|e| e.to_string())?;
++        }
+         Ok(())
+     }
+ 
+diff --git a/src/tui.rs b/src/tui.rs
+index c403627..a7ae6da 100644
+--- a/src/tui.rs
++++ b/src/tui.rs
+@@ -1,6 +1,10 @@
+ use crate::config::{AppConfig, AppPaths, ThemeConfig};
+ use crate::responses_agent;
+-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
++use crate::session::{SessionStore, SessionSummary};
++use crossterm::event::{
++    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
++    MouseEventKind,
++};
+ use crossterm::event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+ use crossterm::execute;
+ use crossterm::terminal::{
+@@ -80,10 +84,28 @@ struct FilePickerState {
+ pub fn run_tui(paths: AppPaths) -> Result<(), String> {
+     let config = AppConfig::load(&paths)?;
+     let theme = ThemeConfig::load_or_create(&paths.theme_file)?;
+-    let models = load_models(&config).unwrap_or_else(|_| vec![config.model.clone()]);
++    let (models, startup_notice) = match load_models(&config) {
++        Ok(models) if !models.is_empty() => (models, None),
++        Ok(_) => (
++            vec![config.model.clone()],
++            Some("- No Model's found. Are you running AI Proxy's?".to_string()),
++        ),
++        Err(err) => (
++            vec![config.model.clone()],
++            Some(format!("- No Model's found. Are you running AI Proxy's? ({err})")),
++        ),
++    };
+     let logo = load_logo(&paths);
+ 
+-    let mut app = App::new(paths, config, models, logo, theme);
++    let mut app = App::new(paths, config, models, logo, theme, startup_notice);
++    app.run()
++}
++
++pub fn run_sessions_tui(paths: AppPaths) -> Result<(), String> {
++    let config = AppConfig::load(&paths)?;
++    let theme = ThemeConfig::load_or_create(&paths.theme_file)?;
++    let sessions = SessionStore::new(&paths)?.list(&paths.project_key)?;
++    let mut app = SessionPickerApp::new(paths, config, sessions, theme);
+     app.run()
+ }
+ 
+@@ -103,6 +125,7 @@ struct App {
+     overlay: Overlay,
+     logo: Vec<String>,
+     theme: ThemeConfig,
++    startup_notice: Option<String>,
+     started_at: Instant,
+     pending_prompt: Option<FilePickerState>,
+     feed_scroll: u16,
+@@ -116,6 +139,7 @@ impl App {
+         models: Vec<String>,
+         logo: Vec<String>,
+         theme: ThemeConfig,
++        startup_notice: Option<String>,
+     ) -> Self {
+         let selected_model = models
+             .iter()
+@@ -137,6 +161,7 @@ impl App {
+             overlay: Overlay::None,
+             logo,
+             theme,
++            startup_notice,
+             started_at: Instant::now(),
+             pending_prompt: None,
+             feed_scroll: 0,
+@@ -670,9 +695,23 @@ impl App {
+             x: area.x + 2,
+             y: logo_area.y + logo_area.height + 1,
+             width: area.width.saturating_sub(4),
+-            height: 1,
++            height: if self.startup_notice.is_some() { 2 } else { 1 },
+         };
+-        frame.render_widget(hint, hint_area);
++        frame.render_widget(hint, Rect { height: 1, ..hint_area });
++        if let Some(notice) = &self.startup_notice {
++            let notice_area = Rect {
++                x: hint_area.x,
++                y: hint_area.y + 1,
++                width: hint_area.width,
++                height: 1,
++            };
++            frame.render_widget(
++                Paragraph::new(notice.clone())
++                    .alignment(Alignment::Center)
++                    .style(Style::default().fg(self.theme.muted)),
++                notice_area,
++            );
++        }
+     }
+ 
+     fn draw_feed(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+@@ -703,12 +742,16 @@ impl App {
+             .border_type(BorderType::Rounded);
+         let viewport_rows = area.height.saturating_sub(2);
+         let max_scroll = lines.len().saturating_sub(viewport_rows as usize) as u16;
+-        let scroll_rows = self.feed_scroll.min(max_scroll);
++        let scroll_rows = self.feed_scroll.min(max_scroll) as usize;
++        let visible = lines
++            .into_iter()
++            .skip(scroll_rows)
++            .take(viewport_rows as usize)
++            .collect::<Vec<_>>();
+         frame.render_widget(
+-            Paragraph::new(lines)
++            Paragraph::new(visible)
+                 .block(block)
+-                .wrap(Wrap { trim: false })
+-                .scroll((scroll_rows, 0)),
++                .wrap(Wrap { trim: false }),
+             area,
+         );
+     }
+@@ -1080,6 +1123,18 @@ fn load_models(config: &AppConfig) -> Result<Vec<String>, String> {
+         .build()
+         .map_err(|e| e.to_string())?;
+     runtime.block_on(async {
++        let health_url = format!("{}/health", config.base_url.trim_end_matches('/'));
++        let health_response = reqwest::Client::new()
++            .get(health_url)
++            .send()
++            .await
++            .map_err(|e| e.to_string())?;
++        if !health_response.status().is_success() {
++            return Err(format!(
++                "health endpoint returned {}",
++                health_response.status()
++            ));
++        }
+         let url = format!("{}/models", config.base_url.trim_end_matches('/'));
+         let response = reqwest::Client::new()
+             .get(url)
+@@ -1644,6 +1699,7 @@ fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>, String> {
+     enable_raw_mode().map_err(|e| e.to_string())?;
+     let mut stdout = io::stdout();
+     execute!(stdout, EnterAlternateScreen).map_err(|e| e.to_string())?;
++    execute!(stdout, EnableMouseCapture).map_err(|e| e.to_string())?;
+     execute!(
+         stdout,
+         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+@@ -1656,6 +1712,7 @@ fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>, String> {
+ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<(), String> {
+     disable_raw_mode().map_err(|e| e.to_string())?;
+     execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags).map_err(|e| e.to_string())?;
++    execute!(terminal.backend_mut(), DisableMouseCapture).map_err(|e| e.to_string())?;
+     execute!(terminal.backend_mut(), LeaveAlternateScreen).map_err(|e| e.to_string())?;
+     terminal.show_cursor().map_err(|e| e.to_string())
+ }
+@@ -1667,3 +1724,211 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+     let y = area.y + (area.height.saturating_sub(height)) / 2;
+     Rect::new(x, y, width, height)
+ }
++
++struct SessionPickerApp {
++    paths: AppPaths,
++    config: AppConfig,
++    sessions: Vec<SessionSummary>,
++    theme: ThemeConfig,
++    selected: usize,
++    scroll: usize,
++    should_quit: bool,
++    chosen: Option<SessionSummary>,
++}
++
++impl SessionPickerApp {
++    fn new(
++        paths: AppPaths,
++        config: AppConfig,
++        sessions: Vec<SessionSummary>,
++        theme: ThemeConfig,
++    ) -> Self {
++        Self {
++            paths,
++            config,
++            sessions,
++            theme,
++            selected: 0,
++            scroll: 0,
++            should_quit: false,
++            chosen: None,
++        }
++    }
++
++    fn run(&mut self) -> Result<(), String> {
++        let mut terminal = init_terminal()?;
++        let result = self.event_loop(&mut terminal);
++        let restore_result = restore_terminal(&mut terminal);
++        match (result, restore_result) {
++            (Ok(()), Ok(())) => {
++                if let Some(session) = &self.chosen {
++                    println!("selected session: {}", session.id);
++                    println!("title: {}", session.summary.clone().unwrap_or_default());
++                } else {
++                    println!("no session selected");
++                }
++                Ok(())
++            }
++            (Err(err), Ok(())) => Err(err),
++            (Ok(()), Err(err)) => Err(err),
++            (Err(err), Err(_restore_err)) => Err(err),
++        }
++    }
++
++    fn event_loop(
++        &mut self,
++        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
++    ) -> Result<(), String> {
++        loop {
++            terminal
++                .draw(|frame| self.draw(frame))
++                .map_err(|e| e.to_string())?;
++
++            if self.should_quit {
++                break;
++            }
++
++            if event::poll(Duration::from_millis(50)).map_err(|e| e.to_string())? {
++                match event::read().map_err(|e| e.to_string())? {
++                    Event::Key(key) => self.handle_key(key),
++                    Event::Mouse(mouse) => match mouse.kind {
++                        MouseEventKind::ScrollDown => self.scroll(6),
++                        MouseEventKind::ScrollUp => self.scroll(-6),
++                        _ => {}
++                    },
++                    _ => {}
++                }
++            }
++        }
++        Ok(())
++    }
++
++    fn handle_key(&mut self, key: KeyEvent) {
++        match key.code {
++            KeyCode::Esc => self.should_quit = true,
++            KeyCode::Enter => {
++                self.chosen = self.sessions.get(self.selected).cloned();
++                self.should_quit = true;
++            }
++            KeyCode::Up => self.move_selection(-1),
++            KeyCode::Down => self.move_selection(1),
++            KeyCode::PageUp => self.move_selection(-8),
++            KeyCode::PageDown => self.move_selection(8),
++            KeyCode::Home => self.set_selection(0),
++            KeyCode::End => {
++                let last = self.sessions.len().saturating_sub(1);
++                self.set_selection(last);
++            }
++            _ => {}
++        }
++    }
++
++    fn move_selection(&mut self, delta: isize) {
++        if self.sessions.is_empty() {
++            return;
++        }
++        let len = self.sessions.len() as isize;
++        let next = (self.selected as isize + delta).clamp(0, len.saturating_sub(1));
++        self.set_selection(next as usize);
++    }
++
++    fn set_selection(&mut self, selected: usize) {
++        self.selected = selected.min(self.sessions.len().saturating_sub(1));
++        let visible = 8usize;
++        if self.selected < self.scroll {
++            self.scroll = self.selected;
++        } else if self.selected >= self.scroll.saturating_add(visible) {
++            self.scroll = self.selected.saturating_add(1).saturating_sub(visible);
++        }
++    }
++
++    fn scroll(&mut self, delta: i16) {
++        if delta.is_negative() {
++            self.move_selection(-(delta as isize));
++        } else {
++            self.move_selection(delta as isize);
++        }
++    }
++
++    fn draw(&self, frame: &mut ratatui::Frame<'_>) {
++        let area = frame.area();
++        let width = area.width.saturating_sub(14).min(104);
++        let height = area.height.saturating_sub(10).min(18).max(12);
++        let modal = centered_rect(width, height, area);
++        frame.render_widget(Clear, modal);
++
++        let title = format!("sessions  ·  {}", self.config.provider);
++        let visible = modal.height.saturating_sub(4).max(1) as usize;
++        let start = self.scroll.min(self.sessions.len().saturating_sub(1));
++        let end = (start + visible).min(self.sessions.len());
++        let slice = &self.sessions[start..end];
++        let items = slice
++            .iter()
++            .map(|session| {
++                let label = session
++                    .summary
++                    .clone()
++                    .unwrap_or_else(|| session.id.clone());
++                let line = format!(
++                    "{label}  ·  {}  ·  {}",
++                    session.updated_at,
++                    compact_session_id(&session.id)
++                );
++                ListItem::new(Line::from(Span::styled(
++                    line,
++                    Style::default().fg(Color::White),
++                )))
++            })
++            .collect::<Vec<_>>();
++
++        let mut state = ListState::default();
++        state.select(Some(
++            self.selected
++                .saturating_sub(start)
++                .min(slice.len().saturating_sub(1)),
++        ));
++
++        let list = List::new(items)
++            .block(
++                Block::default()
++                    .title(Line::from(vec![
++                        Span::styled(
++                            "riftcli",
++                            Style::default()
++                                .fg(self.theme.accent)
++                                .add_modifier(Modifier::BOLD),
++                        ),
++                        Span::raw("  "),
++                        Span::styled(title, Style::default().fg(self.theme.muted)),
++                    ]))
++                    .borders(Borders::ALL)
++                    .border_style(Style::default().fg(self.theme.border))
++                    .border_type(BorderType::Rounded),
++            )
++            .highlight_style(
++                Style::default()
++                    .fg(Color::Black)
++                    .bg(self.theme.accent)
++                    .add_modifier(Modifier::BOLD),
++            )
++            .highlight_symbol("▸ ");
++        frame.render_stateful_widget(list, modal, &mut state);
++
++        let hint = if self.sessions.is_empty() {
++            "No sessions found"
++        } else {
++            "Enter choose  ·  Esc close  ·  arrows navigate"
++        };
++        frame.render_widget(
++            Paragraph::new(hint)
++                .alignment(Alignment::Center)
++                .style(Style::default().fg(Color::DarkGray)),
++            Rect {
++                x: modal.x + 1,
++                y: modal.y + modal.height.saturating_sub(2),
++                width: modal.width.saturating_sub(2),
++                height: 1,
++            },
++        );
++    }
++}
