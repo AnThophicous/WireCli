@@ -1,6 +1,10 @@
 mod backend;
 mod cli;
 mod config;
+mod id;
+mod orchestrator;
+mod policy;
+mod sandbox;
 mod session;
 
 use std::process;

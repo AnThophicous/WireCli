@@ -6,4 +6,4 @@ description = "Core CLI scaffold for a local-first agent workflow"
 license = "MIT"
 
 [dependencies]
-
+rusqlite = { version = "0.32", features = ["bundled"] }

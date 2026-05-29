@@ -1,6 +1,7 @@
 use crate::config::AppPaths;
-use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use crate::id::next_id;
+use rusqlite::{params, Connection, OptionalExtension};
+use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,6 +17,18 @@ pub struct SessionSummary {
 pub struct SessionEvent {
     pub role: String,
     pub content: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TimelineEvent {
+    pub kind: String,
+    pub role: Option<String>,
+    pub content: Option<String>,
+    pub command: Option<String>,
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
+    pub exit_code: Option<i64>,
+    pub created_at: String,
 }
 
 impl SessionEvent {
@@ -34,194 +47,403 @@ impl SessionEvent {
     }
 }
 
-pub struct SessionStore {
-    sessions_dir: PathBuf,
+pub struct HistoryStore {
+    db_path: PathBuf,
+    project_key: String,
+    root_path: String,
 }
 
-impl SessionStore {
+pub struct SessionStore {
+    history: HistoryStore,
+}
+
+impl HistoryStore {
     pub fn new(paths: &AppPaths) -> Result<Self, String> {
-        fs::create_dir_all(&paths.sessions_dir).map_err(|e| e.to_string())?;
-        Ok(Self {
-            sessions_dir: paths.sessions_dir.clone(),
-        })
+        Self::new_for_project(paths, &paths.project_key, &paths.root_dir.display().to_string())
     }
 
-    pub fn create(&mut self, prompt: &str) -> Result<SessionSummary, String> {
-        let id = new_session_id();
-        let path = self.session_path(&id);
-        let now = now_string();
-        let summary = Some(shorten(prompt, 72));
+    pub fn new_for_project(
+        paths: &AppPaths,
+        project_key: &str,
+        root_path: &str,
+    ) -> Result<Self, String> {
+        if let Some(parent) = paths.history_db.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let store = Self {
+            db_path: paths.history_db.clone(),
+            project_key: project_key.to_string(),
+            root_path: root_path.to_string(),
+        };
+        store.init()?;
+        Ok(store)
+    }
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
+    fn connect(&self) -> Result<Connection, String> {
+        let conn = Connection::open(&self.db_path).map_err(|e| e.to_string())?;
+        conn.busy_timeout(std::time::Duration::from_secs(3))
             .map_err(|e| e.to_string())?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| e.to_string())?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(|e| e.to_string())?;
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(|e| e.to_string())?;
+        Ok(conn)
+    }
 
-        writeln!(
-            file,
-            "session\t{}\t{}\t{}",
-            id,
-            now,
-            summary.clone().unwrap_or_default()
+    fn init(&self) -> Result<(), String> {
+        let conn = self.connect()?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS projects (
+                key TEXT PRIMARY KEY,
+                root_path TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                project_key TEXT NOT NULL REFERENCES projects(key) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                workspace TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS events (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                project_key TEXT NOT NULL REFERENCES projects(key) ON DELETE CASCADE,
+                kind TEXT NOT NULL,
+                role TEXT,
+                content TEXT,
+                command TEXT,
+                stdout TEXT,
+                stderr TEXT,
+                exit_code INTEGER,
+                created_at INTEGER NOT NULL,
+                seq INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_events_session_seq
+                ON events(session_id, seq);
+            CREATE INDEX IF NOT EXISTS idx_sessions_updated_at
+                ON sessions(project_key, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_sessions_project_updated
+                ON sessions(project_key, updated_at DESC, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_events_project_session_seq
+                ON events(project_key, session_id, seq);
+            "#,
+        )
+        .map_err(|e| e.to_string())
+        .and_then(|_| self.migrate_legacy_schema(&conn))
+        .and_then(|_| self.ensure_project(&conn, &self.project_key, &self.root_path, now_ts()))
+    }
+
+    fn migrate_legacy_schema(&self, conn: &Connection) -> Result<(), String> {
+        if !table_has_column(conn, "sessions", "project_key")? {
+            conn.execute("ALTER TABLE sessions ADD COLUMN project_key TEXT", [])
+                .map_err(|e| e.to_string())?;
+            conn.execute(
+                "UPDATE sessions SET project_key = ?1 WHERE project_key IS NULL OR project_key = ''",
+                params![self.project_key],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+
+        if !table_has_column(conn, "events", "project_key")? {
+            conn.execute("ALTER TABLE events ADD COLUMN project_key TEXT", [])
+                .map_err(|e| e.to_string())?;
+            conn.execute(
+                r#"
+                UPDATE events
+                SET project_key = (
+                    SELECT project_key FROM sessions WHERE sessions.id = events.session_id
+                )
+                WHERE project_key IS NULL OR project_key = ''
+                "#,
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+
+        Ok(())
+    }
+
+    pub fn create_session(&self, project_key: &str, root_path: &str, prompt: &str) -> Result<SessionSummary, String> {
+        let conn = self.connect()?;
+        let id = next_id();
+        let now = now_ts();
+        let title = shorten(prompt, 72);
+        self.ensure_project(&conn, project_key, root_path, now)?;
+
+        conn.execute(
+            "INSERT INTO sessions (id, project_key, title, workspace, created_at, updated_at) VALUES (?1, ?2, ?3, NULL, ?4, ?5)",
+            params![id, project_key, title, now, now],
         )
         .map_err(|e| e.to_string())?;
 
         Ok(SessionSummary {
             id,
-            created_at: now.clone(),
-            updated_at: now,
-            summary,
+            created_at: format_ts(now),
+            updated_at: format_ts(now),
+            summary: if title.is_empty() { None } else { Some(title) },
         })
     }
 
-    pub fn append_event(&mut self, session_id: &str, event: SessionEvent) -> Result<(), String> {
-        let path = self.session_path(session_id);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
+    pub fn list_sessions(&self, project_key: &str) -> Result<Vec<SessionSummary>, String> {
+        let conn = self.connect()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, title, created_at, updated_at FROM sessions WHERE project_key = ?1 ORDER BY updated_at DESC, created_at DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![project_key], |row| {
+                let id: String = row.get(0)?;
+                let title: String = row.get(1)?;
+                let created_at: i64 = row.get(2)?;
+                let updated_at: i64 = row.get(3)?;
+                Ok(SessionSummary {
+                    id,
+                    created_at: format_ts(created_at),
+                    updated_at: format_ts(updated_at),
+                    summary: if title.is_empty() { None } else { Some(title) },
+                })
+            })
             .map_err(|e| e.to_string())?;
 
-        writeln!(
-            file,
-            "event\t{}\t{}",
-            event.role,
-            escape_tab_newline(&event.content)
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(row.map_err(|e| e.to_string())?);
+        }
+        Ok(sessions)
+    }
+
+    pub fn load_session(&self, project_key: &str, session_id: &str) -> Result<Option<SessionSummary>, String> {
+        let conn = self.connect()?;
+        let mut stmt = conn
+            .prepare("SELECT id, title, created_at, updated_at FROM sessions WHERE id = ?1 AND project_key = ?2")
+            .map_err(|e| e.to_string())?;
+        let session = stmt
+            .query_row(params![session_id, project_key], |row| {
+                let id: String = row.get(0)?;
+                let title: String = row.get(1)?;
+                let created_at: i64 = row.get(2)?;
+                let updated_at: i64 = row.get(3)?;
+                Ok(SessionSummary {
+                    id,
+                    created_at: format_ts(created_at),
+                    updated_at: format_ts(updated_at),
+                    summary: if title.is_empty() { None } else { Some(title) },
+                })
+            })
+            .optional()
+            .map_err(|e| e.to_string())?;
+        Ok(session)
+    }
+
+    pub fn append_message(
+        &self,
+        project_key: &str,
+        session_id: &str,
+        role: &str,
+        content: &str,
+    ) -> Result<(), String> {
+        let conn = self.connect()?;
+        let now = now_ts();
+        let seq = self.next_seq(&conn, session_id)?;
+        conn.execute(
+            "INSERT INTO events (id, session_id, project_key, kind, role, content, command, stdout, stderr, exit_code, created_at, seq)
+             VALUES (?1, ?2, ?3, 'message', ?4, ?5, NULL, NULL, NULL, NULL, ?6, ?7)",
+            params![next_id(), session_id, project_key, role, content, now, seq],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE sessions SET updated_at = ?2, title = COALESCE(NULLIF(title, ''), ?3) WHERE id = ?1",
+            params![session_id, now, shorten(content, 72)],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn append_command(
+        &self,
+        project_key: &str,
+        session_id: &str,
+        command: &[String],
+        status: &str,
+        exit_code: Option<i64>,
+        stdout: &str,
+        stderr: &str,
+    ) -> Result<(), String> {
+        let conn = self.connect()?;
+        let now = now_ts();
+        let seq = self.next_seq(&conn, session_id)?;
+        conn.execute(
+            "INSERT INTO events (id, session_id, project_key, kind, role, content, command, stdout, stderr, exit_code, created_at, seq)
+             VALUES (?1, ?2, ?3, 'command', NULL, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                next_id(),
+                session_id,
+                project_key,
+                status,
+                command.join(" "),
+                stdout,
+                stderr,
+                exit_code,
+                now,
+                seq,
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE sessions SET updated_at = ?2 WHERE id = ?1",
+            params![session_id, now],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn read_messages(&self, project_key: &str, session_id: &str) -> Result<Vec<SessionEvent>, String> {
+        let conn = self.connect()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT role, content FROM events WHERE session_id = ?1 AND project_key = ?2 AND kind = 'message' ORDER BY created_at ASC, seq ASC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![session_id, project_key], |row| {
+                Ok(SessionEvent {
+                    role: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    content: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                })
+            })
+            .map_err(|e| e.to_string())?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row.map_err(|e| e.to_string())?);
+        }
+        Ok(events)
+    }
+
+    pub fn read_timeline(&self, project_key: &str, session_id: &str) -> Result<Vec<TimelineEvent>, String> {
+        let conn = self.connect()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT kind, role, content, command, stdout, stderr, exit_code, created_at
+                 FROM events WHERE session_id = ?1 AND project_key = ?2 ORDER BY created_at ASC, seq ASC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![session_id, project_key], |row| {
+                let created_at: i64 = row.get(7)?;
+                Ok(TimelineEvent {
+                    kind: row.get::<_, String>(0)?,
+                    role: row.get::<_, Option<String>>(1)?,
+                    content: row.get::<_, Option<String>>(2)?,
+                    command: row.get::<_, Option<String>>(3)?,
+                    stdout: row.get::<_, Option<String>>(4)?,
+                    stderr: row.get::<_, Option<String>>(5)?,
+                    exit_code: row.get::<_, Option<i64>>(6)?,
+                    created_at: format_ts(created_at),
+                })
+            })
+            .map_err(|e| e.to_string())?;
+
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row.map_err(|e| e.to_string())?);
+        }
+        Ok(events)
+    }
+
+    fn next_seq(&self, conn: &Connection, session_id: &str) -> Result<i64, String> {
+        conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
         )
         .map_err(|e| e.to_string())
     }
 
-    pub fn read_events(&self, session_id: &str) -> Result<Vec<SessionEvent>, String> {
-        let path = self.session_path(session_id);
-        let file = fs::File::open(path).map_err(|e| e.to_string())?;
-        let reader = BufReader::new(file);
-        let mut events = Vec::new();
+    fn ensure_project(
+        &self,
+        conn: &Connection,
+        project_key: &str,
+        root_path: &str,
+        now: i64,
+    ) -> Result<(), String> {
+        conn.execute(
+            "INSERT INTO projects (key, root_path, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(key) DO UPDATE SET root_path = excluded.root_path, updated_at = excluded.updated_at",
+            params![project_key, root_path, now, now],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
 
-        for line in reader.lines() {
-            let line = line.map_err(|e| e.to_string())?;
-            let mut parts = line.splitn(3, '\t');
-            match parts.next() {
-                Some("event") => {
-                    let role = parts.next().unwrap_or("").to_string();
-                    let content = unescape_tab_newline(parts.next().unwrap_or(""));
-                    events.push(SessionEvent { role, content });
-                }
-                _ => {}
-            }
-        }
-
-        Ok(events)
+impl SessionStore {
+    pub fn new(paths: &AppPaths) -> Result<Self, String> {
+        Ok(Self {
+            history: HistoryStore::new(paths)?,
+        })
     }
 
-    pub fn list(&self) -> Result<Vec<SessionSummary>, String> {
-        let mut sessions = Vec::new();
-        for entry in fs::read_dir(&self.sessions_dir).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-
-            if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-                let metadata = entry.metadata().map_err(|e| e.to_string())?;
-                let updated_at = metadata
-                    .modified()
-                    .ok()
-                    .and_then(system_time_to_string)
-                    .unwrap_or_else(now_string);
-                let mut summary = self.read_header(&path)?.unwrap_or(SessionSummary {
-                    id: name.to_string(),
-                    created_at: updated_at.clone(),
-                    updated_at: updated_at.clone(),
-                    summary: None,
-                });
-                summary.updated_at = updated_at;
-                sessions.push(summary);
-            }
-        }
-
-        sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        Ok(sessions)
+    pub fn create(&mut self, project_key: &str, root_path: &str, prompt: &str) -> Result<SessionSummary, String> {
+        self.history.create_session(project_key, root_path, prompt)
     }
 
-    pub fn resolve(&self, session_id: Option<String>) -> Result<SessionSummary, String> {
+    pub fn append_event(&mut self, project_key: &str, session_id: &str, event: SessionEvent) -> Result<(), String> {
+        self.history
+            .append_message(project_key, session_id, &event.role, &event.content)
+    }
+
+    pub fn append_command(
+        &mut self,
+        project_key: &str,
+        session_id: &str,
+        command: &[String],
+        status: &str,
+        exit_code: Option<i64>,
+        stdout: &str,
+        stderr: &str,
+    ) -> Result<(), String> {
+        self.history
+            .append_command(project_key, session_id, command, status, exit_code, stdout, stderr)
+    }
+
+    pub fn read_events(&self, project_key: &str, session_id: &str) -> Result<Vec<SessionEvent>, String> {
+        self.history.read_messages(project_key, session_id)
+    }
+
+    pub fn timeline(&self, project_key: &str, session_id: &str) -> Result<Vec<TimelineEvent>, String> {
+        self.history.read_timeline(project_key, session_id)
+    }
+
+    pub fn list(&self, project_key: &str) -> Result<Vec<SessionSummary>, String> {
+        self.history.list_sessions(project_key)
+    }
+
+    pub fn resolve(&self, project_key: &str, session_id: Option<String>) -> Result<SessionSummary, String> {
         match session_id {
-            Some(id) => self.load_summary(&id),
+            Some(id) => self
+                .history
+                .load_session(project_key, &id)?
+                .ok_or_else(|| "no sessions found".to_string()),
             None => self
-                .list()?
+                .history
+                .list_sessions(project_key)?
                 .into_iter()
                 .next()
                 .ok_or_else(|| "no sessions found".to_string()),
         }
     }
-
-    fn load_summary(&self, session_id: &str) -> Result<SessionSummary, String> {
-        let path = self.session_path(session_id);
-        let mut summary = self
-            .read_header(&path)?
-            .ok_or_else(|| "invalid session file".to_string())?;
-
-        let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
-        summary.updated_at = metadata
-            .modified()
-            .ok()
-            .and_then(system_time_to_string)
-            .unwrap_or_else(now_string);
-        summary.id = session_id.to_string();
-        Ok(summary)
-    }
-
-    fn read_header(&self, path: &PathBuf) -> Result<Option<SessionSummary>, String> {
-        let file = fs::File::open(path).map_err(|e| e.to_string())?;
-        let reader = BufReader::new(file);
-        for line in reader.lines() {
-            let line = line.map_err(|e| e.to_string())?;
-            let mut parts = line.splitn(4, '\t');
-            if matches!(parts.next(), Some("session")) {
-                let id = parts.next().unwrap_or("").to_string();
-                let created_at = parts.next().unwrap_or("").to_string();
-                let summary = parts.next().unwrap_or("").to_string();
-                return Ok(Some(SessionSummary {
-                    id,
-                    created_at,
-                    updated_at: String::new(),
-                    summary: if summary.is_empty() {
-                        None
-                    } else {
-                        Some(summary)
-                    },
-                }));
-            }
-        }
-        Ok(None)
-    }
-
-    fn session_path(&self, session_id: &str) -> PathBuf {
-        self.sessions_dir.join(format!("{session_id}.session"))
-    }
-}
-
-fn new_session_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{nanos:x}")
-}
-
-fn now_string() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    secs.to_string()
-}
-
-fn system_time_to_string(time: SystemTime) -> Option<String> {
-    time.duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|duration| duration.as_secs().to_string())
 }
 
 fn shorten(value: &str, max: usize) -> String {
@@ -237,38 +459,34 @@ fn shorten(value: &str, max: usize) -> String {
     out
 }
 
-fn escape_tab_newline(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('\t', "\\t")
-        .replace('\n', "\\n")
+fn now_ts() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
-fn unescape_tab_newline(value: &str) -> String {
-    let mut out = String::new();
-    let mut chars = value.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            match chars.next() {
-                Some('t') => out.push('\t'),
-                Some('n') => out.push('\n'),
-                Some('\\') => out.push('\\'),
-                Some(other) => {
-                    out.push('\\');
-                    out.push(other);
-                }
-                None => out.push('\\'),
-            }
-        } else {
-            out.push(ch);
+fn format_ts(ts: i64) -> String {
+    ts.to_string()
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    let sql = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        if row.map_err(|e| e.to_string())? == column {
+            return Ok(true);
         }
     }
-    out
+    Ok(false)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{escape_tab_newline, shorten, unescape_tab_newline};
+    use super::{shorten, SessionEvent};
 
     #[test]
     fn shorten_keeps_short_text() {
@@ -276,9 +494,9 @@ mod tests {
     }
 
     #[test]
-    fn escape_roundtrip_preserves_tabs_and_newlines() {
-        let original = "a\tb\nc\\d";
-        let encoded = escape_tab_newline(original);
-        assert_eq!(unescape_tab_newline(&encoded), original);
+    fn event_constructors_work() {
+        let event = SessionEvent::user("ping".to_string());
+        assert_eq!(event.role, "user");
+        assert_eq!(event.content, "ping");
     }
 }

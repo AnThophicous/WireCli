@@ -6,10 +6,12 @@ use std::path::PathBuf;
 #[derive(Debug, Clone)]
 pub struct AppPaths {
     pub root_dir: PathBuf,
+    pub project_key: String,
     pub config_dir: PathBuf,
     pub config_file: PathBuf,
     pub data_dir: PathBuf,
-    pub sessions_dir: PathBuf,
+    pub history_db: PathBuf,
+    pub sandboxes_dir: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -42,19 +44,59 @@ impl AppPaths {
             .unwrap_or_else(|| home.join(".local/share"));
 
         let root_dir = env::current_dir().map_err(|e| e.to_string())?;
-        let config_dir = config_root.join("rift-code");
+        let project_key = project_key_for(&root_dir);
+        let config_dir = resolve_writable_dir(
+            &[
+                config_root.join("rift-code"),
+                root_dir.join(".riftcode/config"),
+                PathBuf::from("/tmp/rift-code/config"),
+            ],
+            "config",
+        )?;
         let config_file = config_dir.join("config");
-        let data_dir = data_root.join("rift-code");
-        let sessions_dir = data_dir.join("sessions");
+        let data_dir = resolve_writable_dir(
+            &[
+                data_root.join("rift-code"),
+                root_dir.join(".riftcode/data"),
+                PathBuf::from("/tmp/rift-code/data"),
+            ],
+            "data",
+        )?;
+        let history_db = data_dir.join("history.sqlite3");
+        let sandboxes_dir = data_dir.join("lattice");
 
         Ok(Self {
             root_dir,
+            project_key,
             config_dir,
             config_file,
             data_dir,
-            sessions_dir,
+            history_db,
+            sandboxes_dir,
         })
     }
+}
+
+fn project_key_for(path: &PathBuf) -> String {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| path.clone())
+        .to_string_lossy()
+        .to_string()
+}
+
+fn resolve_writable_dir(candidates: &[PathBuf], label: &str) -> Result<PathBuf, String> {
+    let mut last_error = None;
+    for candidate in candidates {
+        match fs::create_dir_all(candidate) {
+            Ok(()) => return Ok(candidate.clone()),
+            Err(err) => last_error = Some(err.to_string()),
+        }
+    }
+
+    Err(match last_error {
+        Some(err) => format!("unable to create writable {label} directory: {err}"),
+        None => format!("unable to create writable {label} directory"),
+    })
 }
 
 impl AppConfig {
