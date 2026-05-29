@@ -1,0 +1,9 @@
+[package]
+name = "riftcode-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Core CLI scaffold for a local-first agent workflow"
+license = "MIT"
+
+[dependencies]
+
