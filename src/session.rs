@@ -32,6 +32,13 @@ pub struct TimelineEvent {
 }
 
 impl SessionEvent {
+    pub fn developer(content: String) -> Self {
+        Self {
+            role: "developer".to_string(),
+            content,
+        }
+    }
+
     pub fn user(content: String) -> Self {
         Self {
             role: "user".to_string(),
@@ -59,7 +66,11 @@ pub struct SessionStore {
 
 impl HistoryStore {
     pub fn new(paths: &AppPaths) -> Result<Self, String> {
-        Self::new_for_project(paths, &paths.project_key, &paths.root_dir.display().to_string())
+        Self::new_for_project(
+            paths,
+            &paths.project_key,
+            &paths.root_dir.display().to_string(),
+        )
     }
 
     pub fn new_for_project(
@@ -172,7 +183,12 @@ impl HistoryStore {
         Ok(())
     }
 
-    pub fn create_session(&self, project_key: &str, root_path: &str, prompt: &str) -> Result<SessionSummary, String> {
+    pub fn create_session(
+        &self,
+        project_key: &str,
+        root_path: &str,
+        prompt: &str,
+    ) -> Result<SessionSummary, String> {
         let conn = self.connect()?;
         let id = next_id();
         let now = now_ts();
@@ -222,7 +238,11 @@ impl HistoryStore {
         Ok(sessions)
     }
 
-    pub fn load_session(&self, project_key: &str, session_id: &str) -> Result<Option<SessionSummary>, String> {
+    pub fn load_session(
+        &self,
+        project_key: &str,
+        session_id: &str,
+    ) -> Result<Option<SessionSummary>, String> {
         let conn = self.connect()?;
         let mut stmt = conn
             .prepare("SELECT id, title, created_at, updated_at FROM sessions WHERE id = ?1 AND project_key = ?2")
@@ -307,7 +327,11 @@ impl HistoryStore {
         Ok(())
     }
 
-    pub fn read_messages(&self, project_key: &str, session_id: &str) -> Result<Vec<SessionEvent>, String> {
+    pub fn read_messages(
+        &self,
+        project_key: &str,
+        session_id: &str,
+    ) -> Result<Vec<SessionEvent>, String> {
         let conn = self.connect()?;
         let mut stmt = conn
             .prepare(
@@ -330,7 +354,11 @@ impl HistoryStore {
         Ok(events)
     }
 
-    pub fn read_timeline(&self, project_key: &str, session_id: &str) -> Result<Vec<TimelineEvent>, String> {
+    pub fn read_timeline(
+        &self,
+        project_key: &str,
+        session_id: &str,
+    ) -> Result<Vec<TimelineEvent>, String> {
         let conn = self.connect()?;
         let mut stmt = conn
             .prepare(
@@ -395,11 +423,21 @@ impl SessionStore {
         })
     }
 
-    pub fn create(&mut self, project_key: &str, root_path: &str, prompt: &str) -> Result<SessionSummary, String> {
+    pub fn create(
+        &mut self,
+        project_key: &str,
+        root_path: &str,
+        prompt: &str,
+    ) -> Result<SessionSummary, String> {
         self.history.create_session(project_key, root_path, prompt)
     }
 
-    pub fn append_event(&mut self, project_key: &str, session_id: &str, event: SessionEvent) -> Result<(), String> {
+    pub fn append_event(
+        &mut self,
+        project_key: &str,
+        session_id: &str,
+        event: SessionEvent,
+    ) -> Result<(), String> {
         self.history
             .append_message(project_key, session_id, &event.role, &event.content)
     }
@@ -414,15 +452,30 @@ impl SessionStore {
         stdout: &str,
         stderr: &str,
     ) -> Result<(), String> {
-        self.history
-            .append_command(project_key, session_id, command, status, exit_code, stdout, stderr)
+        self.history.append_command(
+            project_key,
+            session_id,
+            command,
+            status,
+            exit_code,
+            stdout,
+            stderr,
+        )
     }
 
-    pub fn read_events(&self, project_key: &str, session_id: &str) -> Result<Vec<SessionEvent>, String> {
+    pub fn read_events(
+        &self,
+        project_key: &str,
+        session_id: &str,
+    ) -> Result<Vec<SessionEvent>, String> {
         self.history.read_messages(project_key, session_id)
     }
 
-    pub fn timeline(&self, project_key: &str, session_id: &str) -> Result<Vec<TimelineEvent>, String> {
+    pub fn timeline(
+        &self,
+        project_key: &str,
+        session_id: &str,
+    ) -> Result<Vec<TimelineEvent>, String> {
         self.history.read_timeline(project_key, session_id)
     }
 
@@ -430,7 +483,11 @@ impl SessionStore {
         self.history.list_sessions(project_key)
     }
 
-    pub fn resolve(&self, project_key: &str, session_id: Option<String>) -> Result<SessionSummary, String> {
+    pub fn resolve(
+        &self,
+        project_key: &str,
+        session_id: Option<String>,
+    ) -> Result<SessionSummary, String> {
         match session_id {
             Some(id) => self
                 .history
@@ -498,5 +555,9 @@ mod tests {
         let event = SessionEvent::user("ping".to_string());
         assert_eq!(event.role, "user");
         assert_eq!(event.content, "ping");
+
+        let developer = SessionEvent::developer("rules".to_string());
+        assert_eq!(developer.role, "developer");
+        assert_eq!(developer.content, "rules");
     }
 }

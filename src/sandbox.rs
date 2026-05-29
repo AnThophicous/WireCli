@@ -18,14 +18,23 @@ pub struct SandboxSummary {
 }
 
 pub struct SandboxManager {
+    root_dir: PathBuf,
     sandboxes_dir: PathBuf,
     scheduler: Arc<BoxScheduler>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommandResult {
+    pub status_code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
 }
 
 impl SandboxManager {
     pub fn new(paths: &AppPaths) -> Result<Self, String> {
         fs::create_dir_all(&paths.sandboxes_dir).map_err(|e| e.to_string())?;
         Ok(Self {
+            root_dir: paths.root_dir.clone(),
             sandboxes_dir: paths.sandboxes_dir.clone(),
             scheduler: shared_scheduler(),
         })
@@ -40,7 +49,7 @@ impl SandboxManager {
         };
 
         let dir = self.sandbox_dir(&summary.id);
-        fs::create_dir_all(dir.join("workspace")).map_err(|e| e.to_string())?;
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         self.write_metadata(&summary)?;
         Ok(summary)
     }
@@ -67,6 +76,11 @@ impl SandboxManager {
             .ok_or_else(|| format!("sandbox not found: {id}"))
     }
 
+    pub fn workspace_path(&self, id: &str) -> PathBuf {
+        let _ = id;
+        self.root_dir.clone()
+    }
+
     pub fn destroy(&self, id: &str) -> Result<(), String> {
         let path = self.sandbox_dir(id);
         if path.exists() {
@@ -76,6 +90,12 @@ impl SandboxManager {
     }
 
     pub fn run(&self, id: &str, command: &[String]) -> Result<ExitStatus, String> {
+        let result = self.run_capture(id, command)?;
+        replay_output(&result.stdout, &result.stderr);
+        Ok(status_from_code(result.status_code))
+    }
+
+    pub fn run_capture(&self, id: &str, command: &[String]) -> Result<CommandResult, String> {
         if command.is_empty() {
             return Err("missing command".to_string());
         }
@@ -86,9 +106,7 @@ impl SandboxManager {
 
         let (tx, rx) = mpsc::channel();
         let summary = self.get(id)?;
-        let sandbox_path = self.sandbox_dir(&summary.id);
-        let workspace = sandbox_path.join("workspace");
-        fs::create_dir_all(&workspace).map_err(|e| e.to_string())?;
+        let workspace = self.workspace_path(&summary.id);
         self.append_trace(&summary.id, "queue", command)?;
 
         let summary_clone = summary.clone();
@@ -102,17 +120,20 @@ impl SandboxManager {
                         Some(code) => format!("exit:{code}"),
                         None => "exit:signal".to_string(),
                     };
-                    replay_output(&run.stdout, &run.stderr);
-                    (run.status, exit_record)
+                    (run.status, exit_record, run.stdout, run.stderr)
                 });
             let _ = tx.send(result);
         })?;
 
         let result = rx.recv().map_err(|e| e.to_string())?;
         match result {
-            Ok((status, exit_record)) => {
+            Ok((status, exit_record, stdout, stderr)) => {
                 self.append_trace(&summary.id, &exit_record, command)?;
-                Ok(status)
+                Ok(CommandResult {
+                    status_code: status.code(),
+                    stdout,
+                    stderr,
+                })
             }
             Err(err) => Err(err),
         }
@@ -327,7 +348,11 @@ fn execute_portable(
     command: &[String],
 ) -> Result<CommandRun, String> {
     let mut process = Command::new(&command[0]);
-    let home_dir = workspace.join("home");
+    let home_dir = workspace
+        .join(".riftcode")
+        .join("boxes")
+        .join(&summary.id)
+        .join("home");
     fs::create_dir_all(&home_dir).map_err(|e| e.to_string())?;
     process
         .current_dir(workspace)
@@ -355,6 +380,26 @@ fn replay_output(stdout: &[u8], stderr: &[u8]) {
     }
     if !stderr.is_empty() {
         let _ = std::io::stderr().write_all(stderr);
+    }
+}
+
+fn status_from_code(code: Option<i32>) -> ExitStatus {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        return match code {
+            Some(code) => ExitStatusExt::from_raw(code << 8),
+            None => ExitStatusExt::from_raw(1 << 8),
+        };
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::ExitStatusExt;
+        return match code {
+            Some(code) => ExitStatusExt::from_raw(code as u32),
+            None => ExitStatusExt::from_raw(1),
+        };
     }
 }
 
