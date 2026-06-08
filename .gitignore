@@ -1,6 +1,7 @@
 /target
 .riftcode/
 bin/wirecli-native
+vendor/
 
 # Wire CLI local state
 .wirecli/

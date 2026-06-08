@@ -41,7 +41,7 @@ jobs:
       - build-windows
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -58,21 +58,27 @@ jobs:
         with:
           name: wirecli-win32-x64
           path: .artifacts/win32-x64
-      - name: Stage platform binaries
+      - name: Publish GitHub release binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          node scripts/stage-platform-binary.mjs linux-x64 .artifacts/linux-x64/wirecli
-          node scripts/stage-platform-binary.mjs win32-x64 .artifacts/win32-x64/wirecli.exe
-      - name: Validate platform packages
-        run: node scripts/check-platform-packages.mjs
-      - name: Publish Linux package
-        run: npm publish ./packages/linux-x64 --access public
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          tag="v${version}"
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Wire CLI ${tag}" --notes "Pre-Beta Releasing Version ${version}"
+          fi
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber \
+            ".artifacts/linux-x64/wirecli#wirecli-linux-x64" \
+            ".artifacts/win32-x64/wirecli.exe#wirecli-win32-x64.exe"
+      - name: Publish npm package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - name: Publish Windows package
-        run: npm publish ./packages/win32-x64 --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - name: Publish root package
-        run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          if npm view "wirecli@${version}" version >/dev/null 2>&1; then
+            echo "wirecli@${version} is already published"
+            exit 0
+          fi
+          npm publish --access public

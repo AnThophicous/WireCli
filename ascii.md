@@ -5,5 +5,5 @@
 ╚███╔███╔╝██║██║  ██║███████╗
  ╚══╝╚══╝ ╚═╝╚═╝  ╚═╝╚══════╝
 
-Pre-Beta Releasing Version 0.1.1 <3
+Pre-Beta Releasing Version 0.1.0 <3
      Made with much S2

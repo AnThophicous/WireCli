@@ -1,6 +1,6 @@
 {
   "name": "wirecli",
-  "version": "0.1.1",
+  "version": "0.1.0",
   "description": "Wire CLI by AnThophicous and contributors",
   "license": "SEE LICENSE IN LICENSE",
   "publishConfig": {
@@ -9,13 +9,13 @@
   "bin": {
     "wirecli": "bin/wirecli.js"
   },
-  "optionalDependencies": {
-    "wirecli-linux-x64": "0.1.1",
-    "wirecli-win32-x64": "0.1.1"
+  "scripts": {
+    "postinstall": "node scripts/install-release-binary.js"
   },
   "files": [
     "README.md",
     "bin/wirecli.js",
+    "scripts/install-release-binary.js",
     "ascii.md"
   ],
   "keywords": [
@@ -27,8 +27,5 @@
   ],
   "engines": {
     "node": ">=18"
-  },
-  "workspaces": [
-    "packages/*"
-  ]
+  }
 }

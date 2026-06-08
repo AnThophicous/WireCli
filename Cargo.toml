@@ -1,6 +1,6 @@
 [package]
 name = "wirecli"
-version = "0.1.1"
+version = "0.1.0"
 edition = "2021"
 description = "Wire CLI for a local-first agent workflow"
 license-file = "LICENSE"
