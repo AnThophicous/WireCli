@@ -5,8 +5,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const platformPackages = {
-  "linux:x64": "@wirecli/linux-x64",
-  "win32:x64": "@wirecli/win32-x64",
+  "linux:x64": "wirecli-linux-x64",
+  "win32:x64": "wirecli-win32-x64",
 };
 
 const packageName = platformPackages[`${process.platform}:${process.arch}`];
