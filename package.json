@@ -2,7 +2,7 @@
   "name": "wirecli",
   "version": "0.1.0",
   "description": "Wire CLI by AnThophicous and contributors",
-  "license": "MIT",
+  "license": "SEE LICENSE IN LICENSE",
   "publishConfig": {
     "access": "public"
   },

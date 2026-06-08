@@ -21,6 +21,18 @@ Current release targets:
 - Linux x64 -> `@wirecli/linux-x64`
 - Windows x64 -> `@wirecli/win32-x64`
 
+## License
+
+Wire CLI core is licensed under GNU GPL v3.
+
+There is one project-specific additional permission under GPLv3 section 7:
+independent extensions, plugins, themes, skills, MCP servers, provider adapters,
+and similar add-ons that only interoperate through Wire CLI's public interfaces do
+not have to be GPLv3 solely because they plug into Wire CLI.
+
+If code is copied from Wire CLI core, Wire CLI itself is modified, or the code is
+distributed as part of the core distribution, the GPLv3 remains in effect.
+
 ## Publishing
 
 The npm release is split into three packages:

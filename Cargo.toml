@@ -3,7 +3,7 @@ name = "wirecli"
 version = "0.1.0"
 edition = "2021"
 description = "Wire CLI for a local-first agent workflow"
-license = "MIT"
+license-file = "LICENSE"
 
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }

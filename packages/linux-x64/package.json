@@ -2,7 +2,7 @@
   "name": "@wirecli/linux-x64",
   "version": "0.1.0",
   "description": "Prebuilt Linux x64 binary for Wire CLI",
-  "license": "MIT",
+  "license": "SEE LICENSE IN LICENSE",
   "publishConfig": {
     "access": "public"
   },
