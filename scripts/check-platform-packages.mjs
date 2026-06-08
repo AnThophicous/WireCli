@@ -13,8 +13,14 @@ let failed = false;
 
 for (const [platformName, binaryName] of required) {
   const binaryPath = path.join(repoRoot, "packages", platformName, "bin", binaryName);
+  const licensePath = path.join(repoRoot, "packages", platformName, "LICENSE");
   if (!fs.existsSync(binaryPath)) {
     console.error(`missing binary for ${platformName}: ${binaryPath}`);
+    failed = true;
+    continue;
+  }
+  if (!fs.existsSync(licensePath)) {
+    console.error(`missing LICENSE for ${platformName}: ${licensePath}`);
     failed = true;
     continue;
   }
