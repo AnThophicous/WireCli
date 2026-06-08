@@ -1,33 +1,27 @@
+mod metadata;
+mod runtime;
+mod types;
+
+pub use types::{CommandResult, SandboxRunOptions, SandboxSummary};
+
+use crate::approvals::{ApprovalResolution, ApprovalStore};
 use crate::config::AppPaths;
 use crate::id::next_id;
 use crate::orchestrator::BoxScheduler;
 use crate::policy::CommandPolicy;
+use metadata::{now_string, sanitize_name};
+use runtime::{execute_cell_command, replay_output, shared_scheduler, status_from_code};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
-use std::sync::{mpsc, Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-#[derive(Debug, Clone)]
-pub struct SandboxSummary {
-    pub id: String,
-    pub name: String,
-    pub created_at: String,
-    pub state: String,
-}
+use std::process::ExitStatus;
+use std::sync::{mpsc, Arc};
 
 pub struct SandboxManager {
     root_dir: PathBuf,
     sandboxes_dir: PathBuf,
+    approvals: ApprovalStore,
     scheduler: Arc<BoxScheduler>,
-}
-
-#[derive(Debug, Clone)]
-pub struct CommandResult {
-    pub status_code: Option<i32>,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
 }
 
 impl SandboxManager {
@@ -36,6 +30,7 @@ impl SandboxManager {
         Ok(Self {
             root_dir: paths.root_dir.clone(),
             sandboxes_dir: paths.sandboxes_dir.clone(),
+            approvals: ApprovalStore::new(paths)?,
             scheduler: shared_scheduler(),
         })
     }
@@ -96,39 +91,60 @@ impl SandboxManager {
     }
 
     pub fn run_capture(&self, id: &str, command: &[String]) -> Result<CommandResult, String> {
+        let summary = self.get(id)?;
+        let workspace = self.workspace_path(&summary.id);
+        let assessment = CommandPolicy::standard().assess_for_workspace(command, &workspace);
+        let approval = self.approve_command(command, "manual Box command", &assessment)?;
+        self.run_capture_approved(
+            id,
+            command,
+            SandboxRunOptions {
+                network_access: approval.network_access,
+                ..SandboxRunOptions::default()
+            },
+        )
+    }
+
+    pub fn run_capture_approved(
+        &self,
+        id: &str,
+        command: &[String],
+        options: SandboxRunOptions,
+    ) -> Result<CommandResult, String> {
         if command.is_empty() {
             return Err("missing command".to_string());
         }
 
-        CommandPolicy::standard()
-            .validate(command)
-            .map_err(|violation| format!("{}: {}", violation.command, violation.reason))?;
-
         let (tx, rx) = mpsc::channel();
         let summary = self.get(id)?;
         let workspace = self.workspace_path(&summary.id);
-        self.append_trace(&summary.id, "queue", command)?;
+        CommandPolicy::standard()
+            .validate_hard_for_workspace(command, &workspace)
+            .map_err(|violation| format!("{}: {}", violation.command, violation.reason))?;
+        self.append_trace(&summary.id, "queue", command, options)?;
+        let sandbox_command = rewrite_command_paths_for_sandbox(command, &workspace);
 
         let summary_clone = summary.clone();
         let workspace_clone = workspace.clone();
-        let command_clone = command.to_vec();
+        let command_clone = sandbox_command;
         let scheduler = Arc::clone(&self.scheduler);
         scheduler.submit(move || {
-            let result = execute_cell_command(&summary_clone, &workspace_clone, &command_clone)
-                .map(|run| {
-                    let exit_record = match run.status.code() {
-                        Some(code) => format!("exit:{code}"),
-                        None => "exit:signal".to_string(),
-                    };
-                    (run.status, exit_record, run.stdout, run.stderr)
-                });
+            let result =
+                execute_cell_command(&summary_clone, &workspace_clone, &command_clone, options)
+                    .map(|run| {
+                        let exit_record = match run.status.code() {
+                            Some(code) => format!("exit:{code}"),
+                            None => "exit:signal".to_string(),
+                        };
+                        (run.status, exit_record, run.stdout, run.stderr)
+                    });
             let _ = tx.send(result);
         })?;
 
         let result = rx.recv().map_err(|e| e.to_string())?;
         match result {
             Ok((status, exit_record, stdout, stderr)) => {
-                self.append_trace(&summary.id, &exit_record, command)?;
+                self.append_trace(&summary.id, &exit_record, command, options)?;
                 Ok(CommandResult {
                     status_code: status.code(),
                     stdout,
@@ -137,6 +153,16 @@ impl SandboxManager {
             }
             Err(err) => Err(err),
         }
+    }
+
+    pub fn approve_command(
+        &self,
+        command: &[String],
+        reason: &str,
+        assessment: &crate::policy::CommandAssessment,
+    ) -> Result<ApprovalResolution, String> {
+        self.approvals
+            .ensure_command_approved(command, reason, assessment)
     }
 
     fn write_metadata(&self, summary: &SandboxSummary) -> Result<(), String> {
@@ -156,15 +182,29 @@ impl SandboxManager {
         Ok(())
     }
 
-    fn append_trace(&self, id: &str, kind: &str, command: &[String]) -> Result<(), String> {
+    fn append_trace(
+        &self,
+        id: &str,
+        kind: &str,
+        command: &[String],
+        options: SandboxRunOptions,
+    ) -> Result<(), String> {
         let path = self.sandbox_dir(id).join("trace.log");
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
             .map_err(|e| e.to_string())?;
-        writeln!(file, "{}\t{}\t{}", kind, now_string(), command.join(" "))
-            .map_err(|e| e.to_string())
+        writeln!(
+            file,
+            "{}\t{}\tnetwork={}\tportable_fallback={}\t{}",
+            kind,
+            now_string(),
+            options.network_access,
+            options.allow_portable_fallback,
+            command.join(" ")
+        )
+        .map_err(|e| e.to_string())
     }
 
     fn read_metadata(&self, path: &Path) -> Result<Option<SandboxSummary>, String> {
@@ -211,285 +251,79 @@ impl SandboxManager {
     }
 }
 
-fn bind_host_paths(process: &mut Command) -> Result<(), String> {
-    for path in ["/usr", "/bin", "/lib", "/lib64", "/sbin"] {
-        let p = Path::new(path);
-        if p.exists() {
-            process.arg("--ro-bind").arg(p).arg(path);
-        }
-    }
-    Ok(())
+fn rewrite_command_paths_for_sandbox(command: &[String], workspace: &Path) -> Vec<String> {
+    let canonical_workspace =
+        fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    command
+        .iter()
+        .map(|arg| rewrite_arg_path_for_sandbox(arg, workspace, &canonical_workspace))
+        .collect()
 }
 
-struct CommandRun {
-    status: ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+fn rewrite_arg_path_for_sandbox(arg: &str, workspace: &Path, canonical_workspace: &Path) -> String {
+    let path = Path::new(arg);
+    if !path.is_absolute() || path.starts_with("/workspace") {
+        return arg.to_string();
+    }
+
+    if let Ok(relative) = path.strip_prefix(workspace) {
+        return workspace_alias(relative);
+    }
+
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if let Ok(relative) = canonical.strip_prefix(canonical_workspace) {
+        return workspace_alias(relative);
+    }
+
+    arg.to_string()
 }
 
-impl CommandRun {
-    fn is_bwrap_namespace_error(&self) -> bool {
-        let stderr = String::from_utf8_lossy(&self.stderr);
-        stderr.contains("bwrap:")
-            && (stderr.contains("NETLINK_ROUTE") || stderr.contains("Operation not permitted"))
-    }
-}
-
-fn execute_cell_command(
-    summary: &SandboxSummary,
-    workspace: &Path,
-    command: &[String],
-) -> Result<CommandRun, String> {
-    #[cfg(target_os = "linux")]
-    {
-        match execute_bwrap(summary, workspace, command, true) {
-            Ok(primary) => {
-                if primary.is_bwrap_namespace_error() {
-                    return execute_portable(summary, workspace, command);
-                }
-                Ok(primary)
-            }
-            Err(err) => {
-                if err.contains("bwrap") || err.contains("Operation not permitted") {
-                    execute_portable(summary, workspace, command)
-                } else {
-                    Err(err)
-                }
-            }
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        execute_portable(summary, workspace, command)
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    {
-        execute_portable(summary, workspace, command)
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn execute_bwrap(
-    summary: &SandboxSummary,
-    workspace: &Path,
-    command: &[String],
-    with_net_namespace: bool,
-) -> Result<CommandRun, String> {
-    let mut process = Command::new("bwrap");
-    process
-        .arg("--die-with-parent")
-        .arg("--unshare-user")
-        .arg("--unshare-pid")
-        .arg("--unshare-ipc")
-        .arg("--unshare-uts")
-        .arg("--uid")
-        .arg("0")
-        .arg("--gid")
-        .arg("0")
-        .arg("--clearenv")
-        .arg("--setenv")
-        .arg("HOME")
-        .arg("/home/rift")
-        .arg("--setenv")
-        .arg("USER")
-        .arg("rift")
-        .arg("--setenv")
-        .arg("LOGNAME")
-        .arg("rift")
-        .arg("--setenv")
-        .arg("PATH")
-        .arg("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-        .arg("--setenv")
-        .arg("SANDBOX_ID")
-        .arg(&summary.id)
-        .arg("--setenv")
-        .arg("SANDBOX_NAME")
-        .arg(&summary.name)
-        .arg("--chdir")
-        .arg("/workspace")
-        .arg("--bind")
-        .arg(workspace)
-        .arg("/workspace")
-        .arg("--tmpfs")
-        .arg("/tmp")
-        .arg("--proc")
-        .arg("/proc")
-        .arg("--dev")
-        .arg("/dev")
-        .arg("--dir")
-        .arg("/home/rift");
-
-    if with_net_namespace {
-        process.arg("--unshare-net");
-    }
-
-    bind_host_paths(&mut process)?;
-
-    let output = process
-        .arg("--")
-        .arg(&command[0])
-        .args(&command[1..])
-        .output()
-        .map_err(|e| e.to_string())?;
-
-    Ok(CommandRun {
-        status: output.status,
-        stdout: output.stdout,
-        stderr: output.stderr,
-    })
-}
-
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-fn execute_portable(
-    summary: &SandboxSummary,
-    workspace: &Path,
-    command: &[String],
-) -> Result<CommandRun, String> {
-    let mut process = Command::new(&command[0]);
-    let home_dir = workspace
-        .join(".riftcode")
-        .join("boxes")
-        .join(&summary.id)
-        .join("home");
-    fs::create_dir_all(&home_dir).map_err(|e| e.to_string())?;
-    process
-        .current_dir(workspace)
-        .env_clear()
-        .env("HOME", &home_dir)
-        .env("USERPROFILE", &home_dir)
-        .env("PATH", portable_path())
-        .env("SANDBOX_ID", &summary.id)
-        .env("SANDBOX_NAME", &summary.name);
-    let output = process
-        .args(&command[1..])
-        .output()
-        .map_err(|e| e.to_string())?;
-
-    Ok(CommandRun {
-        status: output.status,
-        stdout: output.stdout,
-        stderr: output.stderr,
-    })
-}
-
-fn replay_output(stdout: &[u8], stderr: &[u8]) {
-    if !stdout.is_empty() {
-        let _ = std::io::stdout().write_all(stdout);
-    }
-    if !stderr.is_empty() {
-        let _ = std::io::stderr().write_all(stderr);
-    }
-}
-
-fn status_from_code(code: Option<i32>) -> ExitStatus {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        return match code {
-            Some(code) => ExitStatusExt::from_raw(code << 8),
-            None => ExitStatusExt::from_raw(1 << 8),
-        };
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::ExitStatusExt;
-        return match code {
-            Some(code) => ExitStatusExt::from_raw(code as u32),
-            None => ExitStatusExt::from_raw(1),
-        };
-    }
-}
-
-fn shared_scheduler() -> Arc<BoxScheduler> {
-    static SCHEDULER: OnceLock<Arc<BoxScheduler>> = OnceLock::new();
-    Arc::clone(SCHEDULER.get_or_init(|| {
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(2);
-        Arc::new(BoxScheduler::new(workers))
-    }))
+fn workspace_alias(relative: &Path) -> String {
+    let path = Path::new("/workspace").join(relative);
+    path.display().to_string()
 }
 
 pub fn probe_bwrap() -> Result<String, String> {
-    #[cfg(target_os = "windows")]
-    {
-        return Ok("not used on this OS".to_string());
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    {
-        return Ok("unsupported on this OS".to_string());
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let output = Command::new("bwrap")
-            .arg("--version")
-            .output()
-            .map_err(|e| e.to_string())?;
-        if !output.status.success() {
-            return Err("bwrap is installed but did not report a usable version".to_string());
-        }
-        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if version.is_empty() {
-            Ok("available".to_string())
-        } else {
-            Ok(version)
-        }
-    }
-}
-
-fn portable_path() -> String {
-    #[cfg(target_os = "windows")]
-    {
-        return "C:\\Windows\\System32;C:\\Windows;C:\\Windows\\System32\\Wbem".to_string();
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        return "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string();
-    }
-}
-
-fn now_string() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    secs.to_string()
-}
-
-fn sanitize_name(name: &str) -> String {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return "sandbox".to_string();
-    }
-
-    let mut out = String::with_capacity(trimmed.len());
-    for ch in trimmed.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-            out.push(ch);
-        } else if ch.is_whitespace() {
-            out.push('-');
-        }
-    }
-
-    if out.is_empty() {
-        "sandbox".to_string()
-    } else {
-        out
-    }
+    runtime::probe_bwrap()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_name;
+    use super::rewrite_command_paths_for_sandbox;
+    use std::fs;
 
     #[test]
-    fn sanitize_name_rewrites_spaces() {
-        assert_eq!(sanitize_name("My Sandbox"), "My-Sandbox");
+    fn rewrites_host_absolute_workspace_paths_to_sandbox_alias() {
+        let workspace = std::env::temp_dir().join("wirecli-sandbox-path-rewrite");
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        let file = workspace.join("src/lib.rs");
+        fs::write(&file, "").unwrap();
+
+        let command = vec![
+            "rg".to_string(),
+            "-n".to_string(),
+            "fn".to_string(),
+            file.display().to_string(),
+        ];
+        let rewritten = rewrite_command_paths_for_sandbox(&command, &workspace);
+
+        assert_eq!(rewritten[3], "/workspace/src/lib.rs");
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn keeps_system_binary_paths_and_workspace_aliases_unchanged() {
+        let workspace = std::env::temp_dir().join("wirecli-sandbox-path-rewrite-system");
+        let command = vec![
+            "/usr/bin/rg".to_string(),
+            "-n".to_string(),
+            "fn".to_string(),
+            "/workspace/src/lib.rs".to_string(),
+        ];
+        let rewritten = rewrite_command_paths_for_sandbox(&command, &workspace);
+
+        assert_eq!(rewritten[0], "/usr/bin/rg");
+        assert_eq!(rewritten[3], "/workspace/src/lib.rs");
     }
 }

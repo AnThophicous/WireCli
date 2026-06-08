@@ -31,8 +31,11 @@ pub async fn serve(config: GatewayConfig) -> Result<(), String> {
 
     let app = Router::new()
         .route("/health", axum::routing::get(proxy))
+        .route("/v1/health", axum::routing::get(proxy))
         .route("/v1/models", axum::routing::get(proxy))
         .route("/v1/responses", axum::routing::post(proxy))
+        .route("/v1/chat/completions", axum::routing::post(proxy))
+        .route("/v1/chat/completations", axum::routing::post(proxy))
         .fallback(reject_all)
         .with_state(state);
 
@@ -40,9 +43,11 @@ pub async fn serve(config: GatewayConfig) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     let bound = listener.local_addr().map_err(|e| e.to_string())?;
-    println!("rift gateway listening on http://{bound}");
+    println!("wire gateway listening on http://{bound}");
     println!("upstream: {}", upstream_url);
-    println!("accepted routes: GET /health, GET /v1/models, POST /v1/responses");
+    println!(
+        "accepted routes: GET /health, GET /v1/health, GET /v1/models, POST /v1/responses, POST /v1/chat/completions"
+    );
 
     axum::serve(listener, app)
         .with_graceful_shutdown(wait_for_shutdown())
@@ -60,7 +65,7 @@ async fn proxy(State(state): State<GatewayState>, request: Request<Body>) -> Res
 async fn reject_all() -> Response {
     response_with_text(
         StatusCode::FORBIDDEN,
-        "only POST /v1/responses is supported".to_string(),
+        "only GET /health, GET /v1/health, GET /v1/models, POST /v1/responses or POST /v1/chat/completions is supported".to_string(),
     )
 }
 
@@ -106,8 +111,11 @@ fn rewrite_uri(upstream_base: &str, uri: &Uri) -> Result<Url, String> {
     let mut url = Url::parse(upstream_base).map_err(|e| e.to_string())?;
     let new_path = match path {
         "/health" => "/health".to_string(),
+        "/v1/health" => rewrite_v1_path(url.path(), "health"),
         "/v1/models" => rewrite_v1_path(url.path(), "models"),
         "/v1/responses" => rewrite_v1_path(url.path(), "responses"),
+        "/v1/chat/completions" => rewrite_v1_path(url.path(), "chat/completions"),
+        "/v1/chat/completations" => rewrite_v1_path(url.path(), "chat/completions"),
         other => return Err(format!("unsupported path: {other}")),
     };
     url.set_path(&new_path);
@@ -178,6 +186,26 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_chat_completions_path() {
+        let uri: Uri = "/v1/chat/completions".parse().unwrap();
+        let rewritten = rewrite_uri("http://127.0.0.1:3000/v1", &uri).unwrap();
+        assert_eq!(
+            rewritten.as_str(),
+            "http://127.0.0.1:3000/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn rewrites_chat_completations_typo_path() {
+        let uri: Uri = "/v1/chat/completations".parse().unwrap();
+        let rewritten = rewrite_uri("http://127.0.0.1:3000/v1", &uri).unwrap();
+        assert_eq!(
+            rewritten.as_str(),
+            "http://127.0.0.1:3000/v1/chat/completions"
+        );
+    }
+
+    #[test]
     fn rejects_non_v1_paths() {
         let uri: Uri = "/v1/chat/responses".parse().unwrap();
         assert!(rewrite_uri("http://127.0.0.1:3000/v1", &uri).is_err());
@@ -194,5 +222,12 @@ mod tests {
         let uri: Uri = "/health".parse().unwrap();
         let rewritten = rewrite_uri("http://127.0.0.1:3000/v1", &uri).unwrap();
         assert_eq!(rewritten.as_str(), "http://127.0.0.1:3000/health");
+    }
+
+    #[test]
+    fn rewrites_v1_health_path() {
+        let uri: Uri = "/v1/health".parse().unwrap();
+        let rewritten = rewrite_uri("http://127.0.0.1:3000/v1", &uri).unwrap();
+        assert_eq!(rewritten.as_str(), "http://127.0.0.1:3000/v1/health");
     }
 }

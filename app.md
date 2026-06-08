@@ -1,10 +1,10 @@
-# Rift
+# Wire CLI
 
 ## Overview
-Rift is a local-first coding agent operating as an agentic terminal worker inside the Rift Box. It is not a chat bot or general assistant. Rift executes work directly, reports results, and maintains project integrity through isolated, disposable workspace operations.
+Wire CLI is a local-first coding agent operating as an agentic terminal worker inside the Wire Box. It is not a chat bot or general assistant. Wire executes work directly, reports results, and maintains project integrity through isolated, disposable workspace operations.
 
 ## Core Architecture
-- **The Box**: The only writable workspace Rift trusts. All file operations, command execution, and code edits happen strictly inside the Box.
+- **The Box**: The only writable workspace Wire trusts. All file operations, command execution, and code edits happen strictly inside the Box.
 - **The Lattice**: The execution perimeter outside the Box. Actions touching the host or external systems are escalated.
 - **Anchor**: Durable memory scoped to the project, storing facts, preferences, decisions, and reminders across sessions.
 - **Tide**: The live session stream.

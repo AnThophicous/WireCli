@@ -28,12 +28,12 @@ index d92f58d..96b7c28 100644
          Command::Run { prompt } => run_prompt(&paths, prompt),
 @@ -269,6 +272,7 @@ fn print_help() {
      println!("usage:");
-     println!("  riftcli");
-     println!("  riftcli tui");
-+    println!("  riftcli sessions");
-     println!("  riftcli run <prompt...>");
-     println!("  riftcli models");
-     println!("  riftcli providers");
+    println!("  wirecli");
+    println!("  wirecli tui");
++    println!("  wirecli sessions");
+    println!("  wirecli run <prompt...>");
+    println!("  wirecli models");
+    println!("  wirecli providers");
 @@ -325,4 +329,13 @@ mod tests {
              _ => panic!("expected tui command"),
          }
@@ -63,12 +63,12 @@ index 2df4130..4f213cf 100644
 @@ -47,6 +48,10 @@ impl AppPaths {
          fs::create_dir_all(&config_dir).map_err(|e| e.to_string())?;
          let config_file = config_dir.join("config.yaml");
-         let theme_file = rift_dir.join("theme.yaml");
-+        let mcp_file = rift_dir.join("mcp_servers.json");
+         let theme_file = wire_dir.join("theme.yaml");
++        let mcp_file = wire_dir.join("mcp_servers.json");
 +        if !mcp_file.exists() {
 +            fs::write(&mcp_file, "{\n  \"servers\": []\n}\n").map_err(|e| e.to_string())?;
 +        }
-         let data_dir = rift_dir.join("data");
+         let data_dir = wire_dir.join("data");
          fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
          let history_db = data_dir.join("history.sqlite3");
 @@ -61,6 +66,7 @@ impl AppPaths {
@@ -512,7 +512,7 @@ index c403627..a7ae6da 100644
 +                Block::default()
 +                    .title(Line::from(vec![
 +                        Span::styled(
-+                            "riftcli",
++                            "wirecli",
 +                            Style::default()
 +                                .fg(self.theme.accent)
 +                                .add_modifier(Modifier::BOLD),

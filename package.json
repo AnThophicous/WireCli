@@ -1,0 +1,34 @@
+{
+  "name": "wirecli",
+  "version": "0.1.0",
+  "description": "Wire CLI by AnThophicous and contributors",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "wirecli": "bin/wirecli.js"
+  },
+  "optionalDependencies": {
+    "@wirecli/linux-x64": "0.1.0",
+    "@wirecli/win32-x64": "0.1.0"
+  },
+  "files": [
+    "README.md",
+    "bin/wirecli.js",
+    "ascii.md"
+  ],
+  "keywords": [
+    "wire",
+    "wirecli",
+    "cli",
+    "rust",
+    "agent"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "workspaces": [
+    "packages/*"
+  ]
+}

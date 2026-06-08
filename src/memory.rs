@@ -1,5 +1,6 @@
 use crate::config::AppPaths;
 use crate::id::next_id;
+use crate::safekey::{is_protected_secret, protect_secret, redact_secrets, reveal_secret};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::fs;
 use std::path::PathBuf;
@@ -29,6 +30,7 @@ pub struct AnchorInput {
 
 pub struct AnchorStore {
     db_path: PathBuf,
+    secret_key_file: PathBuf,
 }
 
 impl AnchorStore {
@@ -38,6 +40,7 @@ impl AnchorStore {
         }
         let store = Self {
             db_path: paths.anchor_db.clone(),
+            secret_key_file: paths.secret_key_file.clone(),
         };
         store.init()?;
         Ok(store)
@@ -81,6 +84,57 @@ impl AnchorStore {
             "#,
         )
         .map_err(|e| e.to_string())?;
+        self.migrate_plaintext_anchors(&conn)?;
+        Ok(())
+    }
+
+    fn migrate_plaintext_anchors(&self, conn: &Connection) -> Result<(), String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, content, tags FROM anchors WHERE content IS NOT NULL AND content != ''",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut updates = Vec::new();
+        for row in rows {
+            let (id, content, tags) = row.map_err(|e| e.to_string())?;
+            let plain = if is_protected_secret(&content) {
+                self.reveal_text(&content).unwrap_or_default()
+            } else {
+                content.clone()
+            };
+            let stored = if is_protected_secret(&content) {
+                content
+            } else {
+                self.protect_text(&plain)?
+            };
+            updates.push((id, stored, search_document(&plain, &tags)));
+        }
+        drop(stmt);
+
+        for (id, stored, index_text) in updates {
+            conn.execute(
+                "UPDATE anchors SET content = ?1 WHERE id = ?2",
+                params![stored, id],
+            )
+            .map_err(|e| e.to_string())?;
+            conn.execute("DELETE FROM anchors_fts WHERE id = ?1", params![id])
+                .map_err(|e| e.to_string())?;
+            conn.execute(
+                "INSERT INTO anchors_fts (id, project_key, kind, content, tags)
+                 SELECT id, project_key, kind, ?2, tags FROM anchors WHERE id = ?1",
+                params![id, index_text],
+            )
+            .map_err(|e| e.to_string())?;
+        }
         Ok(())
     }
 
@@ -89,6 +143,9 @@ impl AnchorStore {
         let id = next_id();
         let now = now_ts();
         let tags = normalize_tags(&input.tags);
+        let content = redact_secrets(&input.content);
+        let stored_content = self.protect_text(&content)?;
+        let index_text = search_document(&content, &tags);
 
         conn.execute(
             "INSERT INTO anchors (id, project_key, kind, content, tags, importance, confidence, source_session_id, created_at, last_used_at)
@@ -97,7 +154,7 @@ impl AnchorStore {
                 id,
                 project_key,
                 input.kind,
-                input.content,
+                stored_content,
                 tags,
                 input.importance,
                 input.confidence,
@@ -113,7 +170,7 @@ impl AnchorStore {
                 id,
                 project_key,
                 input.kind,
-                input.content,
+                index_text,
                 tags,
             ],
         )
@@ -122,7 +179,7 @@ impl AnchorStore {
         Ok(AnchorRecord {
             id,
             kind: input.kind,
-            content: input.content,
+            content,
             tags,
             importance: input.importance,
             confidence: input.confidence,
@@ -157,10 +214,11 @@ impl AnchorStore {
         let rows = stmt
             .query_map(params![project_key, normalized, limit as i64], |row| {
                 let created_at: i64 = row.get(7)?;
+                let content: String = row.get(2)?;
                 Ok(AnchorRecord {
                     id: row.get(0)?,
                     kind: row.get(1)?,
-                    content: row.get(2)?,
+                    content: self.reveal_text(&content).unwrap_or(content),
                     tags: row.get(3)?,
                     importance: row.get(4)?,
                     confidence: row.get(5)?,
@@ -172,7 +230,9 @@ impl AnchorStore {
 
         let mut items = Vec::new();
         for row in rows {
-            items.push(row.map_err(|e| e.to_string())?);
+            let item = row.map_err(|e| e.to_string())?;
+            let _ = self.touch(&item.id);
+            items.push(item);
         }
         Ok(items)
     }
@@ -190,10 +250,11 @@ impl AnchorStore {
         let rows = stmt
             .query_map(params![project_key, limit as i64], |row| {
                 let created_at: i64 = row.get(7)?;
+                let content: String = row.get(2)?;
                 Ok(AnchorRecord {
                     id: row.get(0)?,
                     kind: row.get(1)?,
-                    content: row.get(2)?,
+                    content: self.reveal_text(&content).unwrap_or(content),
                     tags: row.get(3)?,
                     importance: row.get(4)?,
                     confidence: row.get(5)?,
@@ -226,10 +287,11 @@ impl AnchorStore {
         let row = stmt
             .query_row(params![project_key, session_id], |row| {
                 let created_at: i64 = row.get(7)?;
+                let content: String = row.get(2)?;
                 Ok(AnchorRecord {
                     id: row.get(0)?,
                     kind: row.get(1)?,
-                    content: row.get(2)?,
+                    content: self.reveal_text(&content).unwrap_or(content),
                     tags: row.get(3)?,
                     importance: row.get(4)?,
                     confidence: row.get(5)?,
@@ -250,6 +312,14 @@ impl AnchorStore {
         )
         .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    fn protect_text(&self, value: &str) -> Result<String, String> {
+        protect_secret(&self.secret_key_file, value)
+    }
+
+    fn reveal_text(&self, value: &str) -> Result<String, String> {
+        reveal_secret(&self.secret_key_file, value)
     }
 }
 
@@ -273,6 +343,24 @@ fn normalize_query(query: &str) -> String {
     } else {
         tokens.join(" ")
     }
+}
+
+fn search_document(content: &str, tags: &str) -> String {
+    let mut tokens = Vec::new();
+    for token in content
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .chain(tags.split(|ch: char| !ch.is_ascii_alphanumeric()))
+    {
+        let token = token.trim().to_ascii_lowercase();
+        if token.len() < 2 || tokens.iter().any(|existing: &String| existing == &token) {
+            continue;
+        }
+        tokens.push(token);
+        if tokens.len() >= 160 {
+            break;
+        }
+    }
+    tokens.join(" ")
 }
 
 fn now_ts() -> i64 {

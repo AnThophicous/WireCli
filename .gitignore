@@ -1,2 +1,7 @@
 /target
 .riftcode/
+bin/wirecli-native
+
+# Wire CLI local state
+.wirecli/
+.wci/
