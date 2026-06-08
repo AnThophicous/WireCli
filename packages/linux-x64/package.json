@@ -1,6 +1,6 @@
 {
   "name": "wirecli-linux-x64",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Prebuilt Linux x64 binary for Wire CLI",
   "license": "SEE LICENSE IN LICENSE",
   "publishConfig": {

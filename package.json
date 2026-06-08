@@ -1,6 +1,6 @@
 {
   "name": "wirecli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Wire CLI by AnThophicous and contributors",
   "license": "SEE LICENSE IN LICENSE",
   "publishConfig": {
@@ -10,8 +10,8 @@
     "wirecli": "bin/wirecli.js"
   },
   "optionalDependencies": {
-    "wirecli-linux-x64": "0.1.0",
-    "wirecli-win32-x64": "0.1.0"
+    "wirecli-linux-x64": "0.1.1",
+    "wirecli-win32-x64": "0.1.1"
   },
   "files": [
     "README.md",

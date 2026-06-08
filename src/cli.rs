@@ -352,7 +352,7 @@ pub fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Command::Version => {
-            println!("wirecli 0.1.0");
+            println!("wirecli 0.1.1");
             Ok(())
         }
         Command::Tui => crate::tui::run_tui(paths),
@@ -1141,7 +1141,7 @@ fn lattice_command(paths: &AppPaths, action: LatticeAction) -> Result<(), String
 }
 
 fn print_help() {
-    println!("wirecli 0.1.0");
+    println!("wirecli 0.1.1");
     println!();
     println!("usage:");
     println!("  wirecli");
