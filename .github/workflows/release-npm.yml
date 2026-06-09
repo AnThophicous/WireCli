@@ -10,13 +10,13 @@ jobs:
   build-linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Build Linux binary
         run: cargo build --release --locked
       - name: Upload Linux artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wirecli-linux-x64
           path: target/release/wirecli
@@ -24,13 +24,13 @@ jobs:
   build-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Build Windows binary
         run: cargo build --release --locked
       - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wirecli-win32-x64
           path: target/release/wirecli.exe
@@ -43,18 +43,18 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
-          node-version: 20
+          node-version: 24
           registry-url: https://registry.npmjs.org
       - name: Download Linux artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: wirecli-linux-x64
           path: .artifacts/linux-x64
       - name: Download Windows artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: wirecli-win32-x64
           path: .artifacts/win32-x64
@@ -68,9 +68,11 @@ jobs:
           if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "Wire CLI ${tag}" --notes "Pre-Beta Releasing Version ${version}"
           fi
+          cp .artifacts/linux-x64/wirecli .artifacts/wirecli-linux-x64
+          cp .artifacts/win32-x64/wirecli.exe .artifacts/wirecli-win32-x64.exe
           gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber \
-            ".artifacts/linux-x64/wirecli#wirecli-linux-x64" \
-            ".artifacts/win32-x64/wirecli.exe#wirecli-win32-x64.exe"
+            ".artifacts/wirecli-linux-x64" \
+            ".artifacts/wirecli-win32-x64.exe"
       - name: Publish npm package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -78,8 +80,17 @@ jobs:
           set -euo pipefail
           package_name="$(node -p "require('./package.json').name")"
           version="$(node -p "require('./package.json').version")"
+          npm access set status=public "$package_name" --registry=https://registry.npmjs.org >/dev/null 2>&1 || true
           if npm view "${package_name}@${version}" version >/dev/null 2>&1; then
             echo "${package_name}@${version} is already published"
-            exit 0
+          else
+            npm publish --access public
           fi
-          npm publish --access public
+          npm access set status=public "$package_name" --registry=https://registry.npmjs.org
+      - name: Verify public npm package
+        run: |
+          set -euo pipefail
+          package_name="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+          empty_npmrc="$(mktemp)"
+          NPM_CONFIG_USERCONFIG="$empty_npmrc" npm view "${package_name}@${version}" version --registry=https://registry.npmjs.org
