@@ -11,7 +11,7 @@ A arquitetura combina memória persistente, sandboxing, auditoria, recuperação
 ## NPM
 
 ```bash
-npm install -g wirecli
+npm install -g @brennoleondesouza/wirecli@latest
 ```
 
 Inicie o Wire:
@@ -23,6 +23,8 @@ wirecli
 O pacote NPM atua como launcher e baixa automaticamente o binário compatível com o sistema operacional e arquitetura do usuário.
 
 Não é necessário instalar Rust ou Cargo para utilizar versões publicadas.
+
+O nome global do comando é sempre `wirecli`.
 
 ---
 

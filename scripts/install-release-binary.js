@@ -131,7 +131,7 @@ async function install() {
 if (require.main === module) {
   install().catch((error) => {
     console.error(`[wirecli] ${error.message}`);
-    console.error("[wirecli] Reinstall with `npm install -g wirecli@latest` after checking network access.");
+    console.error("[wirecli] Reinstall with `npm install -g @brennoleondesouza/wirecli@latest` after checking network access.");
     process.exit(1);
   });
 }
